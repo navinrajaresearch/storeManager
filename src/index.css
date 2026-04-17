@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Ambient light — GPU-composited transform only, zero repaint per frame */
+@keyframes ambientSpin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.ambient-light {
+  position: absolute;
+  width: 160%;
+  height: 160%;
+  top: -30%;
+  left: -30%;
+  background: conic-gradient(
+    from 0deg at 38% 52%,
+    transparent           0deg,
+    rgba(251,146,60,.38)  55deg,
+    transparent           105deg,
+    transparent           155deg,
+    rgba(147,210,252,.42) 215deg,
+    transparent           268deg,
+    transparent           330deg,
+    rgba(251,191,36,.22)  360deg
+  );
+  filter: blur(38px);
+  animation: ambientSpin 26s linear infinite;
+  will-change: transform;
+  pointer-events: none;
+}
+
+/* Allow text selection in inputs and chat bubbles */
+input, textarea, select, .selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
