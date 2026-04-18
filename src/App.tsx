@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Store, BookOpen, Cloud, CloudOff, Loader2, LogOut } from "lucide-react";
-import { type Session, checkCredentials, getSession, startOAuth, signOut, pushEvents, pullEvents } from "./lib/auth";
+import { type Session, checkCredentials, getSession, startOAuth, signOut, pushEvents, pullEvents, localCleanup, cleanupDriveLogs } from "./lib/auth";
 import { LoginScreen } from "./components/LoginScreen";
 import { SetupScreen } from "./components/SetupScreen";
 
@@ -155,6 +155,40 @@ export default function App() {
       }
     }, 30000);
     return () => clearInterval(interval);
+  }, [authState]);
+
+  // Local SQLite housekeeping — every 5 minutes
+  useEffect(() => {
+    if (typeof authState === "string") return;
+    const interval = setInterval(() => { localCleanup().catch(() => {}); }, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [authState]);
+
+  // Nightly Drive cleanup — once per calendar day, with 5-min retry if locked
+  useEffect(() => {
+    if (typeof authState === "string") return;
+    const today = new Date().toISOString().split("T")[0];
+    if (localStorage.getItem("lastDriveCleanup") === today) return;
+
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const attempt = async (retryCount: number) => {
+      try {
+        await cleanupDriveLogs();
+        localStorage.setItem("lastDriveCleanup", today);
+      } catch (e) {
+        // Another device holds the lock — retry after 5 min (up to 3 times)
+        if (String(e).includes("cleanup_locked") && retryCount < 3) {
+          retryTimer = setTimeout(() => attempt(retryCount + 1), 5 * 60 * 1000);
+        }
+        // Network / auth errors: silently give up, try again next launch
+      }
+    };
+
+    // Random 0–30 s jitter so multiple devices don't race at startup
+    const jitter = Math.random() * 30_000;
+    retryTimer = setTimeout(() => attempt(0), jitter);
+    return () => { if (retryTimer) clearTimeout(retryTimer); };
   }, [authState]);
 
   // Pull when window regains focus — picks up changes from other devices

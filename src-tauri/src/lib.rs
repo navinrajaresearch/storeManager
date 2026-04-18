@@ -871,7 +871,13 @@ async fn push_events(
         .join("\n");
 
     let batch_id = Uuid::new_v4().to_string();
-    let file_name = format!("cmd_{}_{}.jsonl", state.device_id, batch_id);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Embed unix timestamp so cleanup can determine file age from name alone.
+    // Format: cmd_{device_id}_{unix_ts}_{batch_uuid}.jsonl
+    let file_name = format!("cmd_{}_{}_{}.jsonl", state.device_id, ts, batch_id);
     drive::upload_command_batch(&session.access_token, &file_name, jsonl.into_bytes()).await?;
 
     {
@@ -958,6 +964,109 @@ async fn pull_events(
     Ok(total_applied)
 }
 
+// ── Local periodic housekeeping ───────────────────────────────────────────────
+
+/// Runs every 5 minutes from the frontend. Removes data that is no longer needed
+/// from the local SQLite database:
+///
+/// 1. `command_log` rows that have been pushed to Drive (`pushed = 1`).
+///    Once uploaded they serve no local purpose.
+///
+/// 2. `applied_batches` rows whose filename encodes a timestamp older than 48 hours.
+///    The nightly Drive cleanup deletes files after 24 h, so by 48 h the entry is
+///    stale and we will never see that file again.
+///    Rows using the old 3-part filename format (no embedded timestamp) are left alone.
+///
+/// Returns the total number of rows deleted.
+#[tauri::command]
+async fn local_cleanup(state: State<'_, AppState>) -> Result<u32, String> {
+    let db = state.db.lock().await;
+
+    // 1. Delete all pushed command_log rows
+    let pushed_deleted = db
+        .execute("DELETE FROM command_log WHERE pushed = 1", [])
+        .map_err(|e| e.to_string())? as u32;
+
+    // 2. Prune applied_batches rows whose embedded timestamp is > 48 hours old.
+    //    Filename format: cmd_{device_uuid}_{unix_ts}_{batch_uuid}.jsonl
+    //    UUIDs have no underscores, so split('_') yields exactly 4 parts.
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(48 * 3600);
+
+    let batch_ids: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT id FROM applied_batches")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .filter(|name: &String| {
+                // parse timestamp from 3rd segment of the filename stem
+                let stem = name.strip_suffix(".jsonl").unwrap_or(name.as_str());
+                let parts: Vec<&str> = stem.split('_').collect();
+                if parts.len() != 4 { return false; } // old format — keep
+                parts[2].parse::<u64>().map_or(false, |ts| ts < cutoff)
+            })
+            .collect()
+    };
+
+    let mut batches_deleted = 0u32;
+    for id in &batch_ids {
+        if db
+            .execute("DELETE FROM applied_batches WHERE id = ?1", rusqlite::params![id])
+            .is_ok()
+        {
+            batches_deleted += 1;
+        }
+    }
+
+    Ok(pushed_deleted + batches_deleted)
+}
+
+// ── Nightly Drive log cleanup ─────────────────────────────────────────────────
+
+/// Delete cmd_*.jsonl files from Drive that are older than 24 hours.
+///
+/// Uses a `cleanup.lock` file as a distributed lock so only one device runs the
+/// cleanup at a time. Returns `Err("cleanup_locked")` if another device currently
+/// holds the lock; the frontend should retry after 5 minutes.
+#[tauri::command]
+async fn cleanup_drive_logs(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let session = match auth::load_session(&app_data) {
+        None => return Ok(0),
+        Some(s) => auth::ensure_valid_token(&app_data, s).await?,
+    };
+
+    // Acquire the distributed lock — returns None if another device holds it
+    let lock_id = match drive::try_acquire_cleanup_lock(&session.access_token).await? {
+        Some(id) => id,
+        None => return Err("cleanup_locked".to_string()),
+    };
+
+    // Delete command files older than 24 hours
+    let stale = drive::list_stale_command_files(&session.access_token, 24 * 60 * 60)
+        .await
+        .unwrap_or_default();
+    let mut deleted = 0u32;
+    for file_id in &stale {
+        if drive::delete_drive_file(&session.access_token, file_id).await.is_ok() {
+            deleted += 1;
+        }
+    }
+
+    // Always release the lock, even if some deletes failed
+    let _ = drive::release_cleanup_lock(&session.access_token, &lock_id).await;
+
+    Ok(deleted)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1039,6 +1148,8 @@ pub fn run() {
             drive::drive_pull,
             push_events,
             pull_events,
+            local_cleanup,
+            cleanup_drive_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
