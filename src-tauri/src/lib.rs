@@ -1,23 +1,17 @@
+mod auth;
+mod drive;
+
 use std::sync::Arc;
 use std::io::{BufRead, BufReader, Write};
 use base64::{engine::general_purpose, Engine as _};
+use serde_json::json;
 
-use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int32Array, RecordBatch,
-    RecordBatchIterator, StringArray,
-};
-use arrow_schema::{DataType, Field, Schema};
-use futures::TryStreamExt;
-use lancedb::{connect, Connection};
-use lancedb::query::ExecutableQuery;
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
-
-const VECTOR_DIM: i32 = 64;
-const TABLE_NAME: &str = "products_v3";
-const EMPLOYEE_TABLE: &str = "employees_v1";
 
 // ── Domain ────────────────────────────────────────────────────────────────────
 
@@ -28,6 +22,10 @@ pub struct Product {
     #[serde(rename = "sourceLanguage")]
     pub source_language: String,
     pub name: String,
+    #[serde(default = "default_category")]
+    pub category: String,
+    #[serde(rename = "supplierId", default = "default_empty_supplier")]
+    pub supplier_id: String,
     #[serde(rename = "manufactureDate")]
     pub manufacture_date: String,
     #[serde(rename = "expiryDate")]
@@ -45,22 +43,55 @@ pub struct Product {
     /// JSON-encoded Vec<String> of data-URL blobs for display (max 2)
     pub images: Vec<String>,
     #[serde(rename = "salesHistory", default)]
-    pub sales_history: String,  // "YYYY-MM-DD:qty,YYYY-MM-DD:qty,..." — last 30 days
+    pub sales_history: String,
 }
 
-/// Wraps a long-lived PaddleOCR Python daemon process.
-/// The daemon reads image paths from stdin and writes RESULT_START/RESULT_END blocks.
+fn default_category() -> String { "Food & Beverage".to_string() }
+fn default_empty_supplier() -> String { String::new() }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Supplier {
+    pub id: String,
+    pub name: String,
+    pub phone: String,
+}
+fn default_salary_type() -> String { "monthly".to_string() }
+fn default_empty_string() -> String { String::new() }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Employee {
+    pub id: String,
+    pub name: String,
+    pub photo: String,
+    pub salary: f64,
+    #[serde(rename = "salaryType", default = "default_salary_type")]
+    pub salary_type: String,
+    pub dob: String,
+    #[serde(rename = "joiningDate")]
+    pub joining_date: String,
+    #[serde(rename = "mobileNumber")]
+    pub mobile_number: String,
+    #[serde(rename = "checkInDays")]
+    pub check_in_days: i32,
+    #[serde(rename = "lastCheckIn")]
+    pub last_check_in: String,
+    #[serde(rename = "checkInHistory", default = "default_empty_string")]
+    pub check_in_history: String,
+    #[serde(rename = "salaryHistory", default = "default_empty_string")]
+    pub salary_history: String,
+}
+
+// ── PaddleOCR daemon ──────────────────────────────────────────────────────────
+
 struct PaddleDaemon {
     stdin:  std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
 }
 
 impl PaddleDaemon {
-    /// Scan one image; returns the extracted text or an error string.
     fn ocr(&mut self, img_path: &str) -> Result<String, String> {
         writeln!(self.stdin, "{}", img_path).map_err(|e| e.to_string())?;
         self.stdin.flush().map_err(|e| e.to_string())?;
-
         let mut lines: Vec<String> = Vec::new();
         let mut collecting = false;
         loop {
@@ -81,691 +112,335 @@ impl PaddleDaemon {
     }
 }
 
+// ── App state ─────────────────────────────────────────────────────────────────
+
 pub struct AppState {
-    pub db: Mutex<Connection>,
-    /// PaddleOCR daemon — spawned in a background thread at startup so the
-    /// app window opens immediately. None until the model finishes loading.
-    paddle: Arc<Mutex<Option<PaddleDaemon>>>,
+    pub db:        Mutex<Connection>,
+    pub embedder:  Arc<Mutex<TextEmbedding>>,
+    paddle:        Arc<Mutex<Option<PaddleDaemon>>>,
+    pub device_id: String,
 }
 
-// ── Employee domain ───────────────────────────────────────────────────────────
+// ── DB init ───────────────────────────────────────────────────────────────────
 
-fn default_salary_type() -> String { "monthly".to_string() }
-fn default_empty_string() -> String { String::new() }
+fn init_db(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("
+        PRAGMA journal_mode=WAL;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Employee {
-    pub id: String,
-    pub name: String,
-    /// data-URL of the employee photo (may be empty string)
-    pub photo: String,
-    pub salary: f64,
-    /// "monthly" or "hourly"
-    #[serde(rename = "salaryType", default = "default_salary_type")]
-    pub salary_type: String,
-    /// "YYYY-MM-DD" or "N/A"
-    pub dob: String,
-    #[serde(rename = "joiningDate")]
-    pub joining_date: String,
-    /// Mobile / contact number (free-form string)
-    #[serde(rename = "mobileNumber")]
-    pub mobile_number: String,
-    /// Total number of days the employee has checked in
-    #[serde(rename = "checkInDays")]
-    pub check_in_days: i32,
-    /// Date of the last check-in "YYYY-MM-DD" or "N/A"
-    #[serde(rename = "lastCheckIn")]
-    pub last_check_in: String,
-    /// Comma-separated list of check-in dates "YYYY-MM-DD,YYYY-MM-DD,..."
-    #[serde(rename = "checkInHistory", default = "default_empty_string")]
-    pub check_in_history: String,
-    /// JSON array of salary history entries: [{"date":"YYYY-MM-DD","salary":50000,"salaryType":"monthly"}]
-    #[serde(rename = "salaryHistory", default = "default_empty_string")]
-    pub salary_history: String,
+        CREATE TABLE IF NOT EXISTS products (
+            id               TEXT PRIMARY KEY,
+            brand            TEXT NOT NULL DEFAULT '',
+            source_language  TEXT NOT NULL DEFAULT '',
+            name             TEXT NOT NULL DEFAULT '',
+            category         TEXT NOT NULL DEFAULT 'Food & Beverage',
+            manufacture_date TEXT NOT NULL DEFAULT '',
+            expiry_date      TEXT NOT NULL DEFAULT '',
+            image_location   TEXT NOT NULL DEFAULT '[]',
+            quantity         INTEGER NOT NULL DEFAULT 0,
+            sold_quantity    INTEGER NOT NULL DEFAULT 0,
+            buy_price        REAL NOT NULL DEFAULT 0.0,
+            sell_price       REAL NOT NULL DEFAULT 0.0,
+            images_json      TEXT NOT NULL DEFAULT '[]',
+            sales_history    TEXT NOT NULL DEFAULT '',
+            supplier_id      TEXT NOT NULL DEFAULT '',
+            embedding        BLOB
+        );
+
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id    TEXT PRIMARY KEY,
+            name  TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS command_log (
+            id        TEXT PRIMARY KEY,
+            ts        TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            cmd       TEXT NOT NULL,
+            args      TEXT NOT NULL,
+            pushed    INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS applied_batches (
+            id TEXT PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS employees (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL DEFAULT '',
+            photo            TEXT NOT NULL DEFAULT '',
+            salary           REAL NOT NULL DEFAULT 0.0,
+            salary_type      TEXT NOT NULL DEFAULT 'monthly',
+            dob              TEXT NOT NULL DEFAULT 'N/A',
+            joining_date     TEXT NOT NULL DEFAULT '',
+            mobile_number    TEXT NOT NULL DEFAULT '',
+            check_in_days    INTEGER NOT NULL DEFAULT 0,
+            last_check_in    TEXT NOT NULL DEFAULT 'N/A',
+            check_in_history TEXT NOT NULL DEFAULT '',
+            salary_history   TEXT NOT NULL DEFAULT ''
+        );
+    ").map_err(|e| e.to_string())
 }
 
-// ── Arrow schema ──────────────────────────────────────────────────────────────
+// ── Vector helpers ────────────────────────────────────────────────────────────
 
-fn product_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id",               DataType::Utf8,    false),
-        Field::new("brand",            DataType::Utf8,    false),
-        Field::new("source_language",  DataType::Utf8,    false),
-        Field::new("name",             DataType::Utf8,    false),
-        Field::new("manufacture_date", DataType::Utf8,    false),
-        Field::new("expiry_date",      DataType::Utf8,    false),
-        Field::new("image_location",   DataType::Utf8,    false), // JSON array
-        Field::new("quantity",         DataType::Int32,   false),
-        Field::new("sold_quantity",    DataType::Int32,   false),
-        Field::new("buy_price",        DataType::Float64, false),
-        Field::new("sell_price",       DataType::Float64, false),
-        Field::new("images_json",      DataType::Utf8,    false), // JSON array of data-URLs
-        Field::new("sales_history",    DataType::Utf8,    false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                VECTOR_DIM,
-            ),
-            true,
-        ),
-    ]))
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn pseudo_vector(text: &str) -> Vec<f32> {
-    let mut v = vec![0.0f32; VECTOR_DIM as usize];
-    for (i, c) in text.chars().enumerate() {
-        let idx = (i + c as usize) % VECTOR_DIM as usize;
-        v[idx] += (c as u8) as f32 / 255.0;
-    }
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-    v.iter_mut().for_each(|x| *x /= norm);
-    v
+fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
-fn to_json(v: &[String]) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "[]".into())
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na < 1e-8 || nb < 1e-8 { 0.0 } else { dot / (na * nb) }
 }
 
-fn from_json(s: &str) -> Vec<String> {
-    serde_json::from_str(s).unwrap_or_default()
-}
-
-fn products_to_batch(products: &[Product]) -> Result<RecordBatch, String> {
-    let schema = product_schema();
-
-    macro_rules! utf8 {
-        ($expr:expr) => {
-            Arc::new(StringArray::from(
-                products.iter().map($expr).collect::<Vec<_>>(),
-            )) as ArrayRef
-        };
-    }
-
-    let ids          = utf8!(|p| p.id.as_str());
-    let brands       = utf8!(|p| p.brand.as_str());
-    let langs        = utf8!(|p| p.source_language.as_str());
-    let names        = utf8!(|p| p.name.as_str());
-    let mfg_dates    = utf8!(|p| p.manufacture_date.as_str());
-    let exp_dates    = utf8!(|p| p.expiry_date.as_str());
-    let img_locs: ArrayRef = Arc::new(StringArray::from(
-        products.iter().map(|p| to_json(&p.image_location)).collect::<Vec<_>>(),
-    ));
-    let quantities: ArrayRef = Arc::new(Int32Array::from(
-        products.iter().map(|p| p.quantity).collect::<Vec<_>>(),
-    ));
-    let sold_qtys: ArrayRef = Arc::new(Int32Array::from(
-        products.iter().map(|p| p.sold_quantity).collect::<Vec<_>>(),
-    ));
-    let buy_prices: ArrayRef = Arc::new(Float64Array::from(
-        products.iter().map(|p| p.buy_price).collect::<Vec<_>>(),
-    ));
-    let sell_prices: ArrayRef = Arc::new(Float64Array::from(
-        products.iter().map(|p| p.sell_price).collect::<Vec<_>>(),
-    ));
-    let images_json: ArrayRef = Arc::new(StringArray::from(
-        products.iter().map(|p| to_json(&p.images)).collect::<Vec<_>>(),
-    ));
-    let sales_histories = utf8!(|p| p.sales_history.as_str());
-
-    let flat: Vec<f32> = products
-        .iter()
-        .flat_map(|p| pseudo_vector(&format!("{} {} {}", p.brand, p.name, p.source_language)))
-        .collect();
-    let float_arr = Arc::new(Float32Array::from(flat));
-    let vectors: ArrayRef = Arc::new(
-        FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            VECTOR_DIM,
-            float_arr,
-            None,
-        )
-        .map_err(|e| e.to_string())?,
-    );
-
-    RecordBatch::try_new(
-        schema,
-        vec![
-            ids, brands, langs, names, mfg_dates, exp_dates,
-            img_locs, quantities, sold_qtys, buy_prices, sell_prices,
-            images_json, sales_histories, vectors,
-        ],
-    )
-    .map_err(|e| e.to_string())
-}
-
-async fn open_or_create(db: &Connection) -> Result<lancedb::Table, String> {
-    let names = db.table_names().execute().await.map_err(|e| e.to_string())?;
-    if names.contains(&TABLE_NAME.to_string()) {
-        let table = db.open_table(TABLE_NAME).execute().await.map_err(|e| e.to_string())?;
-
-        // Migration: add sales_history column if missing
-        let has_sales_history = table.schema().await
-            .map(|s| s.column_with_name("sales_history").is_some())
-            .unwrap_or(false);
-
-        if !has_sales_history {
-            // Read existing rows inline (NOT via fetch_all to avoid recursion)
-            let existing: Vec<Product> = {
-                let batches: Vec<RecordBatch> = table
-                    .query()
-                    .execute()
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .try_collect()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let mut rows = Vec::new();
-                for batch in batches {
-                    macro_rules! sp {
-                        ($col:expr) => {
-                            batch.column_by_name($col).unwrap()
-                                .as_any().downcast_ref::<StringArray>().unwrap()
-                        };
-                    }
-                    let ids       = sp!("id");
-                    let brands    = sp!("brand");
-                    let langs     = sp!("source_language");
-                    let names_col = sp!("name");
-                    let mfg       = sp!("manufacture_date");
-                    let exp       = sp!("expiry_date");
-                    let img_locs  = sp!("image_location");
-                    let imgs      = sp!("images_json");
-                    let qtys  = batch.column_by_name("quantity").unwrap()
-                        .as_any().downcast_ref::<Int32Array>().unwrap();
-                    let sold  = batch.column_by_name("sold_quantity").unwrap()
-                        .as_any().downcast_ref::<Int32Array>().unwrap();
-                    let buy   = batch.column_by_name("buy_price").unwrap()
-                        .as_any().downcast_ref::<Float64Array>().unwrap();
-                    let sell  = batch.column_by_name("sell_price").unwrap()
-                        .as_any().downcast_ref::<Float64Array>().unwrap();
-                    for i in 0..batch.num_rows() {
-                        rows.push(Product {
-                            id:               ids.value(i).to_string(),
-                            brand:            brands.value(i).to_string(),
-                            source_language:  langs.value(i).to_string(),
-                            name:             names_col.value(i).to_string(),
-                            manufacture_date: mfg.value(i).to_string(),
-                            expiry_date:      exp.value(i).to_string(),
-                            image_location:   from_json(img_locs.value(i)),
-                            quantity:         qtys.value(i),
-                            sold_quantity:    sold.value(i),
-                            buy_price:        buy.value(i),
-                            sell_price:       sell.value(i),
-                            images:           from_json(imgs.value(i)),
-                            sales_history:    String::new(),
-                        });
-                    }
-                }
-                rows
-            };
-
-            // Drop the old table and recreate with the new schema
-            db.drop_table(TABLE_NAME).await.map_err(|e| e.to_string())?;
-            let schema = product_schema();
-            let empty = RecordBatch::new_empty(schema.clone());
-            let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-            let new_table = db
-                .create_table(TABLE_NAME, Box::new(reader))
-                .execute()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Re-insert the existing products with sales_history defaulted to ""
-            if !existing.is_empty() {
-                let batch = products_to_batch(&existing)?;
-                let schema = batch.schema();
-                let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-                new_table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
-            }
-
-            return Ok(new_table);
-        }
-
-        Ok(table)
-    } else {
-        let schema = product_schema();
-        let empty = RecordBatch::new_empty(schema.clone());
-        let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-        db.create_table(TABLE_NAME, Box::new(reader))
-            .execute()
-            .await
-            .map_err(|e| e.to_string())
-    }
-}
-
-async fn fetch_all(db: &Connection) -> Result<Vec<Product>, String> {
-    let table = open_or_create(db).await?;
-
-    let batches: Vec<RecordBatch> = table
-        .query()
-        .execute()
-        .await
+fn embed_text(embedder: &TextEmbedding, text: &str) -> Result<Vec<f32>, String> {
+    embedder
+        .embed(vec![text.to_string()], None)
         .map_err(|e| e.to_string())?
-        .try_collect()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut products = Vec::new();
-    for batch in batches {
-        macro_rules! s {
-            ($col:expr) => {
-                batch
-                    .column_by_name($col)
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-            };
-        }
-        let ids       = s!("id");
-        let brands    = s!("brand");
-        let langs     = s!("source_language");
-        let names     = s!("name");
-        let mfg       = s!("manufacture_date");
-        let exp       = s!("expiry_date");
-        let img_locs  = s!("image_location");
-        let qtys      = batch.column_by_name("quantity").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
-        let sold      = batch.column_by_name("sold_quantity").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
-        let buy       = batch.column_by_name("buy_price").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
-        let sell      = batch.column_by_name("sell_price").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
-        let imgs      = s!("images_json");
-        let sales_hist = batch.column_by_name("sales_history")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-        for i in 0..batch.num_rows() {
-            products.push(Product {
-                id:               ids.value(i).to_string(),
-                brand:            brands.value(i).to_string(),
-                source_language:  langs.value(i).to_string(),
-                name:             names.value(i).to_string(),
-                manufacture_date: mfg.value(i).to_string(),
-                expiry_date:      exp.value(i).to_string(),
-                image_location:   from_json(img_locs.value(i)),
-                quantity:         qtys.value(i),
-                sold_quantity:    sold.value(i),
-                buy_price:        buy.value(i),
-                sell_price:       sell.value(i),
-                images:           from_json(imgs.value(i)),
-                sales_history:    sales_hist.map(|a| a.value(i)).unwrap_or("").to_string(),
-            });
-        }
-    }
-
-    Ok(products)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "embedding returned empty".into())
 }
 
-// ── Employee Arrow schema + helpers ──────────────────────────────────────────
+// ── Row mappers ───────────────────────────────────────────────────────────────
 
-fn employee_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id",                 DataType::Utf8,    false),
-        Field::new("name",               DataType::Utf8,    false),
-        Field::new("photo",              DataType::Utf8,    false),
-        Field::new("salary",             DataType::Float64, false),
-        Field::new("salary_type",        DataType::Utf8,    false),
-        Field::new("dob",                DataType::Utf8,    false),
-        Field::new("joining_date",       DataType::Utf8,    false),
-        Field::new("mobile_number",      DataType::Utf8,    false),
-        Field::new("check_in_days",      DataType::Int32,   false),
-        Field::new("last_check_in",      DataType::Utf8,    false),
-        Field::new("check_in_history",   DataType::Utf8,    false),
-        Field::new("salary_history",     DataType::Utf8,    false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                VECTOR_DIM,
-            ),
-            true,
-        ),
-    ]))
+fn row_to_product(row: &rusqlite::Row<'_>) -> rusqlite::Result<Product> {
+    Ok(Product {
+        id:               row.get(0)?,
+        brand:            row.get(1)?,
+        source_language:  row.get(2)?,
+        name:             row.get(3)?,
+        category:         row.get::<_, String>(4).unwrap_or_else(|_| "Food & Beverage".into()),
+        supplier_id:      row.get::<_, String>(5).unwrap_or_default(),
+        manufacture_date: row.get(6)?,
+        expiry_date:      row.get(7)?,
+        image_location:   serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+        quantity:         row.get(9)?,
+        sold_quantity:    row.get(10)?,
+        buy_price:        row.get(11)?,
+        sell_price:       row.get(12)?,
+        images:           serde_json::from_str(&row.get::<_, String>(13)?).unwrap_or_default(),
+        sales_history:    row.get(14)?,
+    })
 }
 
-fn employees_to_batch(employees: &[Employee]) -> Result<RecordBatch, String> {
-    let schema = employee_schema();
-
-    macro_rules! utf8e {
-        ($expr:expr) => {
-            Arc::new(StringArray::from(
-                employees.iter().map($expr).collect::<Vec<_>>(),
-            )) as ArrayRef
-        };
-    }
-
-    let ids              = utf8e!(|e| e.id.as_str());
-    let names            = utf8e!(|e| e.name.as_str());
-    let photos           = utf8e!(|e| e.photo.as_str());
-    let salaries: ArrayRef = Arc::new(Float64Array::from(
-        employees.iter().map(|e| e.salary).collect::<Vec<_>>(),
-    ));
-    let salary_types     = utf8e!(|e| e.salary_type.as_str());
-    let dobs             = utf8e!(|e| e.dob.as_str());
-    let joins            = utf8e!(|e| e.joining_date.as_str());
-    let mobiles          = utf8e!(|e| e.mobile_number.as_str());
-    let checkins: ArrayRef = Arc::new(Int32Array::from(
-        employees.iter().map(|e| e.check_in_days).collect::<Vec<_>>(),
-    ));
-    let last_ci          = utf8e!(|e| e.last_check_in.as_str());
-    let check_in_history = utf8e!(|e| e.check_in_history.as_str());
-    let salary_history   = utf8e!(|e| e.salary_history.as_str());
-
-    let flat: Vec<f32> = employees
-        .iter()
-        .flat_map(|e| pseudo_vector(&e.name))
-        .collect();
-    let float_arr = Arc::new(Float32Array::from(flat));
-    let vectors: ArrayRef = Arc::new(
-        FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            VECTOR_DIM,
-            float_arr,
-            None,
-        )
-        .map_err(|e| e.to_string())?,
-    );
-
-    RecordBatch::try_new(
-        schema,
-        vec![ids, names, photos, salaries, salary_types, dobs, joins, mobiles, checkins, last_ci, check_in_history, salary_history, vectors],
-    )
-    .map_err(|e| e.to_string())
+fn row_to_employee(row: &rusqlite::Row<'_>) -> rusqlite::Result<Employee> {
+    Ok(Employee {
+        id:               row.get(0)?,
+        name:             row.get(1)?,
+        photo:            row.get(2)?,
+        salary:           row.get(3)?,
+        salary_type:      row.get::<_, String>(4).unwrap_or_else(|_| "monthly".into()),
+        dob:              row.get(5)?,
+        joining_date:     row.get(6)?,
+        mobile_number:    row.get(7)?,
+        check_in_days:    row.get(8)?,
+        last_check_in:    row.get(9)?,
+        check_in_history: row.get(10).unwrap_or_default(),
+        salary_history:   row.get(11).unwrap_or_default(),
+    })
 }
 
-async fn open_or_create_employees(db: &Connection) -> Result<lancedb::Table, String> {
-    let table_names = db.table_names().execute().await.map_err(|e| e.to_string())?;
-    if table_names.contains(&EMPLOYEE_TABLE.to_string()) {
-        let table = db.open_table(EMPLOYEE_TABLE).execute().await.map_err(|e| e.to_string())?;
-        // Migrate: if the table is missing check_in_history (added in this version), rebuild it
-        // with the new schema. This handles both old schemas (no salary_type) and intermediate
-        // schemas (has salary_type but no check_in_history).
-        let schema_now = table.schema().await.map_err(|e| e.to_string())?;
-        let has_check_in_history = schema_now.column_with_name("check_in_history").is_some();
-        if !has_check_in_history {
-            // Determine which optional columns the old table has so we can read safely.
-            let has_salary_type = schema_now.column_with_name("salary_type").is_some();
-
-            // Read all existing rows directly from the old-schema table (avoids recursion).
-            let existing: Vec<Employee> = {
-                let batches: Vec<RecordBatch> = table
-                    .query()
-                    .execute()
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .try_collect()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let mut rows = Vec::new();
-                for batch in batches {
-                    macro_rules! se {
-                        ($col:expr) => {
-                            batch.column_by_name($col).unwrap()
-                                .as_any().downcast_ref::<StringArray>().unwrap()
-                        };
-                    }
-                    let ids     = se!("id");
-                    let names   = se!("name");
-                    let photos  = se!("photo");
-                    let dobs    = se!("dob");
-                    let joins   = se!("joining_date");
-                    let mobiles = se!("mobile_number");
-                    let last_ci = se!("last_check_in");
-                    let salaries = batch.column_by_name("salary").unwrap()
-                        .as_any().downcast_ref::<Float64Array>().unwrap();
-                    let checkins = batch.column_by_name("check_in_days").unwrap()
-                        .as_any().downcast_ref::<Int32Array>().unwrap();
-                    // salary_type may not exist in the oldest schema
-                    let salary_types = if has_salary_type {
-                        batch.column_by_name("salary_type")
-                            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                    } else {
-                        None
-                    };
-                    for i in 0..batch.num_rows() {
-                        let salary_type = salary_types
-                            .map(|a| a.value(i))
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("monthly")
-                            .to_string();
-                        rows.push(Employee {
-                            id:               ids.value(i).to_string(),
-                            name:             names.value(i).to_string(),
-                            photo:            photos.value(i).to_string(),
-                            salary:           salaries.value(i),
-                            salary_type,
-                            dob:              dobs.value(i).to_string(),
-                            joining_date:     joins.value(i).to_string(),
-                            mobile_number:    mobiles.value(i).to_string(),
-                            check_in_days:    checkins.value(i),
-                            last_check_in:    last_ci.value(i).to_string(),
-                            check_in_history: String::new(),
-                            salary_history:   String::new(),
-                        });
-                    }
-                }
-                rows
-            };
-            // Drop and recreate the table with the new schema.
-            db.drop_table(EMPLOYEE_TABLE).await.map_err(|e| e.to_string())?;
-            let schema = employee_schema();
-            let empty = RecordBatch::new_empty(schema.clone());
-            let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-            let new_table = db
-                .create_table(EMPLOYEE_TABLE, Box::new(reader))
-                .execute()
-                .await
-                .map_err(|e| e.to_string())?;
-            // Re-insert existing employees with new fields defaulted to empty.
-            if !existing.is_empty() {
-                let batch = employees_to_batch(&existing)?;
-                let schema = batch.schema();
-                let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-                new_table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
-            }
-            return Ok(new_table);
-        }
-        Ok(table)
-    } else {
-        let schema = employee_schema();
-        let empty = RecordBatch::new_empty(schema.clone());
-        let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-        db.create_table(EMPLOYEE_TABLE, Box::new(reader))
-            .execute()
-            .await
-            .map_err(|e| e.to_string())
-    }
-}
-
-async fn fetch_all_employees(db: &Connection) -> Result<Vec<Employee>, String> {
-    let table = open_or_create_employees(db).await?;
-
-    let batches: Vec<RecordBatch> = table
-        .query()
-        .execute()
-        .await
-        .map_err(|e| e.to_string())?
-        .try_collect()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut employees = Vec::new();
-    for batch in batches {
-        macro_rules! se {
-            ($col:expr) => {
-                batch
-                    .column_by_name($col)
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-            };
-        }
-        let ids      = se!("id");
-        let names    = se!("name");
-        let photos   = se!("photo");
-        let dobs     = se!("dob");
-        let joins    = se!("joining_date");
-        let mobiles  = se!("mobile_number");
-        let last_ci  = se!("last_check_in");
-        let salaries = batch.column_by_name("salary").unwrap()
-            .as_any().downcast_ref::<Float64Array>().unwrap();
-        let checkins = batch.column_by_name("check_in_days").unwrap()
-            .as_any().downcast_ref::<Int32Array>().unwrap();
-        // salary_type / check_in_history / salary_history — may be absent in old rows; use fallbacks
-        let salary_types = batch.column_by_name("salary_type")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let check_in_histories = batch.column_by_name("check_in_history")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let salary_histories = batch.column_by_name("salary_history")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-        for i in 0..batch.num_rows() {
-            let salary_type = salary_types
-                .map(|a| a.value(i))
-                .filter(|s| !s.is_empty())
-                .unwrap_or("monthly")
-                .to_string();
-            let check_in_history = check_in_histories
-                .and_then(|a| Some(a.value(i)))
-                .unwrap_or("")
-                .to_string();
-            let salary_history = salary_histories
-                .and_then(|a| Some(a.value(i)))
-                .unwrap_or("")
-                .to_string();
-            employees.push(Employee {
-                id:               ids.value(i).to_string(),
-                name:             names.value(i).to_string(),
-                photo:            photos.value(i).to_string(),
-                salary:           salaries.value(i),
-                salary_type,
-                dob:              dobs.value(i).to_string(),
-                joining_date:     joins.value(i).to_string(),
-                mobile_number:    mobiles.value(i).to_string(),
-                check_in_days:    checkins.value(i),
-                last_check_in:    last_ci.value(i).to_string(),
-                check_in_history,
-                salary_history,
-            });
-        }
-    }
-    Ok(employees)
-}
-
-// ── Tauri commands ────────────────────────────────────────────────────────────
+// ── Product commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn get_products(state: State<'_, AppState>) -> Result<Vec<Product>, String> {
-    fetch_all(&*state.db.lock().await).await
+    let db = state.db.lock().await;
+    let mut stmt = db.prepare(
+        "SELECT id, brand, source_language, name, category, supplier_id, manufacture_date, expiry_date,
+         image_location, quantity, sold_quantity, buy_price, sell_price,
+         images_json, sales_history FROM products",
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], row_to_product).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn add_product(state: State<'_, AppState>, product: Product) -> Result<Product, String> {
-    let db = state.db.lock().await;
-    let table = open_or_create(&db).await?;
-
     let mut p = product;
     p.images.truncate(2);
     p.image_location.truncate(2);
     p.id = Uuid::new_v4().to_string();
 
-    let batch = products_to_batch(&[p.clone()])?;
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-    table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
+    let embedding = {
+        let embedder = state.embedder.lock().await;
+        embed_text(&embedder, &format!("{} {} {}", p.brand, p.name, p.source_language))?
+    };
+
+    let db = state.db.lock().await;
+    db.execute(
+        "INSERT INTO products (id, brand, source_language, name, category, supplier_id, manufacture_date, expiry_date,
+         image_location, quantity, sold_quantity, buy_price, sell_price, images_json,
+         sales_history, embedding) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![
+            p.id, p.brand, p.source_language, p.name, p.category, p.supplier_id,
+            p.manufacture_date, p.expiry_date,
+            serde_json::to_string(&p.image_location).unwrap_or_else(|_| "[]".into()),
+            p.quantity, p.sold_quantity, p.buy_price, p.sell_price,
+            serde_json::to_string(&p.images).unwrap_or_else(|_| "[]".into()),
+            p.sales_history,
+            vec_to_blob(&embedding),
+        ],
+    ).map_err(|e| e.to_string())?;
+    let p_for_log = Product { images: vec![], ..p.clone() };
+    log_command(&*db, &state.device_id, "ADD_PRODUCT", serde_json::to_value(&p_for_log).unwrap_or_default())?;
     Ok(p)
 }
 
-/// Replace a product in-place (delete old row by id, insert updated row).
 #[tauri::command]
 async fn update_product(state: State<'_, AppState>, product: Product) -> Result<Product, String> {
+    let embedding = {
+        let embedder = state.embedder.lock().await;
+        embed_text(&embedder, &format!("{} {} {}", product.brand, product.name, product.source_language))?
+    };
+
     let db = state.db.lock().await;
-    let table = open_or_create(&db).await?;
-
-    // Remove the existing row first
-    table
-        .delete(&format!("id = '{}'", product.id))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Re-insert the updated row (preserves id, updates all fields)
-    let batch = products_to_batch(&[product.clone()])?;
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-    table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
-
+    db.execute(
+        "UPDATE products SET brand=?2, source_language=?3, name=?4, category=?5, supplier_id=?6,
+         manufacture_date=?7, expiry_date=?8, image_location=?9, quantity=?10, sold_quantity=?11,
+         buy_price=?12, sell_price=?13, images_json=?14, sales_history=?15, embedding=?16
+         WHERE id=?1",
+        params![
+            product.id, product.brand, product.source_language, product.name, product.category, product.supplier_id,
+            product.manufacture_date, product.expiry_date,
+            serde_json::to_string(&product.image_location).unwrap_or_else(|_| "[]".into()),
+            product.quantity, product.sold_quantity, product.buy_price, product.sell_price,
+            serde_json::to_string(&product.images).unwrap_or_else(|_| "[]".into()),
+            product.sales_history,
+            vec_to_blob(&embedding),
+        ],
+    ).map_err(|e| e.to_string())?;
+    let p_for_log = Product { images: vec![], ..product.clone() };
+    log_command(&*db, &state.device_id, "UPDATE_PRODUCT", serde_json::to_value(&p_for_log).unwrap_or_default())?;
     Ok(product)
 }
 
 #[tauri::command]
 async fn delete_product(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let db = state.db.lock().await;
-    let table = open_or_create(&db).await?;
-    table.delete(&format!("id = '{}'", id)).await.map_err(|e| e.to_string())
+    db.execute("DELETE FROM products WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    log_command(&*db, &state.device_id, "DELETE_PRODUCT", json!({"id": id}))?;
+    Ok(())
 }
 
+/// Semantic search: embed the query, rank products by cosine similarity.
+/// Falls back to substring match for products that have no embedding yet.
 #[tauri::command]
 async fn search_products(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<Product>, String> {
-    let q = query.to_lowercase();
-    let all = fetch_all(&*state.db.lock().await).await?;
-    Ok(all
-        .into_iter()
-        .filter(|p| {
-            p.name.to_lowercase().contains(&q)
-                || p.brand.to_lowercase().contains(&q)
-                || p.source_language.to_lowercase().contains(&q)
+    let q = query.trim().to_string();
+    if q.is_empty() {
+        return get_products(state).await;
+    }
+
+    let query_vec = {
+        let embedder = state.embedder.lock().await;
+        embed_text(&embedder, &q)?
+    };
+
+    let db = state.db.lock().await;
+    let mut stmt = db.prepare(
+        "SELECT id, brand, source_language, name, category, manufacture_date, expiry_date,
+         image_location, quantity, sold_quantity, buy_price, sell_price,
+         images_json, sales_history, embedding FROM products",
+    ).map_err(|e| e.to_string())?;
+
+    let ql = q.to_lowercase();
+    let mut scored: Vec<(f32, Product)> = stmt
+        .query_map([], |row| {
+            let product = row_to_product(row)?;
+            let blob: Option<Vec<u8>> = row.get(15)?;
+            Ok((product, blob))
         })
-        .collect())
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .map(|(p, blob)| {
+            let score = if let Some(b) = blob {
+                cosine_similarity(&query_vec, &blob_to_vec(&b))
+            } else {
+                // no embedding yet — fall back to substring score
+                let haystack = format!("{} {} {}", p.name, p.brand, p.source_language).to_lowercase();
+                if haystack.contains(&ql) { 0.5 } else { 0.0 }
+            };
+            (score, p)
+        })
+        .filter(|(score, _)| *score > 0.25)
+        .collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(scored.into_iter().take(20).map(|(_, p)| p).collect())
 }
 
 // ── Employee commands ─────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn get_employees(state: State<'_, AppState>) -> Result<Vec<Employee>, String> {
-    fetch_all_employees(&*state.db.lock().await).await
+    let db = state.db.lock().await;
+    let mut stmt = db.prepare(
+        "SELECT id, name, photo, salary, salary_type, dob, joining_date, mobile_number,
+         check_in_days, last_check_in, check_in_history, salary_history FROM employees",
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], row_to_employee).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn add_employee(state: State<'_, AppState>, employee: Employee) -> Result<Employee, String> {
-    let db = state.db.lock().await;
-    let table = open_or_create_employees(&db).await?;
     let mut e = employee;
     e.id = Uuid::new_v4().to_string();
-    let batch = employees_to_batch(&[e.clone()])?;
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-    table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
+    let db = state.db.lock().await;
+    db.execute(
+        "INSERT INTO employees (id, name, photo, salary, salary_type, dob, joining_date,
+         mobile_number, check_in_days, last_check_in, check_in_history, salary_history)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            e.id, e.name, e.photo, e.salary, e.salary_type, e.dob,
+            e.joining_date, e.mobile_number, e.check_in_days, e.last_check_in,
+            e.check_in_history, e.salary_history,
+        ],
+    ).map_err(|e| e.to_string())?;
+    log_command(&*db, &state.device_id, "ADD_EMPLOYEE", serde_json::to_value(&e).unwrap_or_default())?;
     Ok(e)
 }
 
 #[tauri::command]
 async fn update_employee(state: State<'_, AppState>, employee: Employee) -> Result<Employee, String> {
     let db = state.db.lock().await;
-    let table = open_or_create_employees(&db).await?;
-    table.delete(&format!("id = '{}'", employee.id)).await.map_err(|e| e.to_string())?;
-    let batch = employees_to_batch(&[employee.clone()])?;
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-    table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
+    db.execute(
+        "UPDATE employees SET name=?2, photo=?3, salary=?4, salary_type=?5, dob=?6,
+         joining_date=?7, mobile_number=?8, check_in_days=?9, last_check_in=?10,
+         check_in_history=?11, salary_history=?12 WHERE id=?1",
+        params![
+            employee.id, employee.name, employee.photo, employee.salary, employee.salary_type,
+            employee.dob, employee.joining_date, employee.mobile_number,
+            employee.check_in_days, employee.last_check_in,
+            employee.check_in_history, employee.salary_history,
+        ],
+    ).map_err(|e| e.to_string())?;
+    log_command(&*db, &state.device_id, "UPDATE_EMPLOYEE", serde_json::to_value(&employee).unwrap_or_default())?;
     Ok(employee)
 }
 
 #[tauri::command]
 async fn delete_employee(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let db = state.db.lock().await;
-    let table = open_or_create_employees(&db).await?;
-    table.delete(&format!("id = '{}'", id)).await.map_err(|e| e.to_string())
+    db.execute("DELETE FROM employees WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    log_command(&*db, &state.device_id, "DELETE_EMPLOYEE", json!({"id": id}))?;
+    Ok(())
 }
 
-/// Record one check-in for a given employee on `date` ("YYYY-MM-DD").
-/// For hourly employees, `hours` stores actual hours worked as "YYYY-MM-DD:8.5".
-/// For monthly employees the entry is just "YYYY-MM-DD".
-/// Idempotent: if already checked in today, returns unchanged employee.
 #[tauri::command]
 async fn checkin_employee(
     state: State<'_, AppState>,
@@ -773,27 +448,25 @@ async fn checkin_employee(
     date: String,
     hours: Option<f64>,
 ) -> Result<Employee, String> {
-    let db = state.db.lock().await;
-    let all = fetch_all_employees(&db).await?;
+    let all = get_employees(state.clone()).await?;
     let emp = all
         .into_iter()
         .find(|e| e.id == id)
         .ok_or_else(|| "Employee not found".to_string())?;
 
-    // Idempotent — only count a new day
-    if emp.last_check_in == date {
+    // For monthly employees already checked in today, nothing to do.
+    // For hourly employees already checked in today, allow updating the hours.
+    let is_update = emp.last_check_in == date;
+    if is_update && emp.salary_type != "hourly" {
         return Ok(emp);
     }
 
-    // Build the entry: "YYYY-MM-DD:hours" for hourly, "YYYY-MM-DD" for monthly
     let entry = if emp.salary_type == "hourly" {
-        let h = hours.unwrap_or(8.0);
-        format!("{}:{}", date, h)
+        format!("{}:{}", date, hours.unwrap_or(0.0))
     } else {
         date.clone()
     };
 
-    // Append entry, deduplicate by date prefix, keep only most recent 30 days
     let new_check_in_history = {
         let mut entries: Vec<String> = emp.check_in_history
             .split(',')
@@ -801,11 +474,9 @@ async fn checkin_employee(
             .map(String::from)
             .collect();
         let date_prefix = format!("{}:", date);
-        let already = entries.iter().any(|e| e == &date || e.starts_with(&date_prefix));
-        if !already {
-            entries.push(entry);
-        }
-        // Sort by date (first 10 chars) and keep last 30
+        // Remove existing entry for today (so we can replace it with updated hours)
+        entries.retain(|e| e != &date && !e.starts_with(&date_prefix));
+        entries.push(entry);
         entries.sort_by(|a, b| a[..10.min(a.len())].cmp(&b[..10.min(b.len())]));
         if entries.len() > 30 {
             entries = entries[entries.len() - 30..].to_vec();
@@ -813,44 +484,38 @@ async fn checkin_employee(
         entries.join(",")
     };
 
+    // check_in_days only increments on first check-in for the day
     let updated = Employee {
-        check_in_days:    emp.check_in_days + 1,
+        check_in_days:    if is_update { emp.check_in_days } else { emp.check_in_days + 1 },
         last_check_in:    date,
         check_in_history: new_check_in_history,
         ..emp
     };
 
-    let table = open_or_create_employees(&db).await?;
-    table.delete(&format!("id = '{}'", updated.id)).await.map_err(|e| e.to_string())?;
-    let batch = employees_to_batch(&[updated.clone()])?;
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-    table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
+    update_employee(state.clone(), updated.clone()).await?;
+    {
+        let db = state.db.lock().await;
+        log_command(&*db, &state.device_id, "CHECKIN_EMPLOYEE", serde_json::to_value(&updated).unwrap_or_default())?;
+    }
     Ok(updated)
 }
 
-// Python helper script embedded at compile time
+// ── OCR ───────────────────────────────────────────────────────────────────────
+
 const PADDLE_SCRIPT: &str = include_str!("../ocr_paddle.py");
 
-/// Write the bundled PaddleOCR helper to a stable temp path (once per process).
 fn ensure_paddle_script() -> std::path::PathBuf {
     let path = std::env::temp_dir().join("sm_paddle_ocr.py");
-    // Always overwrite so updates to the script are picked up after an app upgrade
     let _ = std::fs::write(&path, PADDLE_SCRIPT);
     path
 }
 
-/// Resolve the best available Python 3 binary.
-/// Prefers the project .venv (where PaddleOCR is installed by setup scripts).
 fn python_bin() -> String {
-    // .venv sub-path differs by platform
     #[cfg(target_os = "windows")]
     let venv_python: &[&str] = &[".venv", "Scripts", "python.exe"];
     #[cfg(not(target_os = "windows"))]
     let venv_python: &[&str] = &[".venv", "bin", "python3"];
 
-    // Walk up from the exe and from CWD (up to 4 levels) looking for .venv.
-    // This covers: installed app, tauri dev (CWD = src-tauri), and project root.
     let search_roots: Vec<std::path::PathBuf> = [
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())),
         std::env::current_dir().ok(),
@@ -877,7 +542,6 @@ fn python_bin() -> String {
         }
     }
 
-    // macOS: Homebrew fallbacks (Apple Silicon then Intel)
     #[cfg(target_os = "macos")]
     {
         if std::path::Path::new("/opt/homebrew/bin/python3").exists() {
@@ -888,7 +552,6 @@ fn python_bin() -> String {
         }
     }
 
-    // Windows: check common user-install locations
     #[cfg(target_os = "windows")]
     {
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
@@ -904,8 +567,6 @@ fn python_bin() -> String {
     "python3".to_string()
 }
 
-/// Spawn the PaddleOCR daemon and wait for DAEMON_READY.
-/// Returns None if Python/PaddleOCR is unavailable.
 fn spawn_paddle_daemon() -> Option<PaddleDaemon> {
     let script = ensure_paddle_script();
     let mut child = std::process::Command::new(python_bin())
@@ -921,54 +582,20 @@ fn spawn_paddle_daemon() -> Option<PaddleDaemon> {
     let stdout = BufReader::new(child.stdout.take()?);
     let mut daemon = PaddleDaemon { stdin, stdout };
 
-    // Wait for the ready signal (model loading happens here)
     let mut line = String::new();
     daemon.stdout.read_line(&mut line).ok()?;
-    if line.trim() == "DAEMON_READY" {
-        Some(daemon)
-    } else {
-        None
-    }
+    if line.trim() == "DAEMON_READY" { Some(daemon) } else { None }
 }
 
-/// Tesseract fallback — run each language model independently and combine.
-/// Running all languages together (eng+tam+tel) causes cross-script garbling
-/// where a single output line contains mixed Latin + Tamil + Telugu characters.
-fn try_tesseract(img_path: &str) -> Result<String, String> {
-    let mut all_lines: Vec<String> = Vec::new();
-    for lang in &["eng", "tam", "tel", "hin"] {
-        let text_opt = tesseract::Tesseract::new(None, Some(lang)).ok()
-            .and_then(|t| t.set_image(img_path).ok())
-            .and_then(|mut t| t.get_text().ok());
-        if let Some(text) = text_opt {
-            for line in text.lines() {
-                let line = line.trim().to_string();
-                if line.len() > 1 && !all_lines.contains(&line) {
-                    all_lines.push(line);
-                }
-            }
-        }
-    }
-    if all_lines.is_empty() {
-        Err("no text extracted".to_string())
-    } else {
-        Ok(all_lines.join("\n"))
-    }
-}
-
-/// Extract text from a data-URL image.
-/// Uses the long-lived PaddleOCR daemon (fast after first load); falls back to Tesseract.
 #[tauri::command]
 async fn extract_text_from_image(
     data_url: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    // Decode base64 payload
     let comma = data_url.find(',').ok_or("invalid data-URL: no comma")?;
     let b64 = &data_url[comma + 1..];
     let bytes = general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string())?;
 
-    // Derive correct file extension from MIME type
     let mime_end = data_url.find(';').unwrap_or(comma);
     let mime = &data_url[5..mime_end];
     let ext = match mime {
@@ -983,88 +610,352 @@ async fn extract_text_from_image(
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     let img_path = path.to_string_lossy().to_string();
 
-    // Try PaddleOCR daemon → Tesseract fallback
-    let text = {
-        let paddle = Arc::clone(&state.paddle);
-        let img = img_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = paddle.blocking_lock();
-            if let Some(daemon) = guard.as_mut() {
-                match daemon.ocr(&img) {
-                    Ok(t) if !t.is_empty() => Ok(t),
-                    _ => try_tesseract(&img),
-                }
-            } else {
-                try_tesseract(&img)
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())??
-    };
+    let paddle = Arc::clone(&state.paddle);
+    let img = img_path.clone();
+    let text = tokio::task::spawn_blocking(move || {
+        let mut guard = paddle.blocking_lock();
+        if let Some(daemon) = guard.as_mut() {
+            daemon.ocr(&img).unwrap_or_else(|_| String::new())
+        } else {
+            String::new()
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     let _ = std::fs::remove_file(&path);
-    Ok(text)
+    if text.is_empty() {
+        Err("no text extracted".into())
+    } else {
+        Ok(text)
+    }
+}
+
+// ── Supplier commands ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_suppliers(state: State<'_, AppState>) -> Result<Vec<Supplier>, String> {
+    let db = state.db.lock().await;
+    let mut stmt = db.prepare("SELECT id, name, phone FROM suppliers ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Supplier { id: row.get(0)?, name: row.get(1)?, phone: row.get(2)? })
+    }).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn add_supplier(state: State<'_, AppState>, supplier: Supplier) -> Result<Supplier, String> {
+    let mut s = supplier;
+    s.id = Uuid::new_v4().to_string();
+    let db = state.db.lock().await;
+    db.execute(
+        "INSERT INTO suppliers (id, name, phone) VALUES (?1, ?2, ?3)",
+        params![s.id, s.name, s.phone],
+    ).map_err(|e| e.to_string())?;
+    log_command(&*db, &state.device_id, "ADD_SUPPLIER", serde_json::to_value(&s).unwrap_or_default())?;
+    Ok(s)
+}
+
+#[tauri::command]
+async fn delete_supplier(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let db = state.db.lock().await;
+    // Clear supplier reference from products first
+    db.execute("UPDATE products SET supplier_id='' WHERE supplier_id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    db.execute("DELETE FROM suppliers WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    log_command(&*db, &state.device_id, "DELETE_SUPPLIER", json!({"id": id}))?;
+    Ok(())
 }
 
 // ── Export / Import ───────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 struct ExportBundle {
-    version: u32,
-    products: Vec<Product>,
+    version:   u32,
+    products:  Vec<Product>,
     employees: Vec<Employee>,
 }
 
-/// Serialise the entire database to a JSON string.
 #[tauri::command]
 async fn export_data(state: State<'_, AppState>) -> Result<String, String> {
-    let db = state.db.lock().await;
-    let products  = fetch_all(&db).await?;
-    let employees = fetch_all_employees(&db).await?;
-    serde_json::to_string(&ExportBundle { version: 1, products, employees })
+    let products  = get_products(state.clone()).await?;
+    let employees = get_employees(state.clone()).await?;
+    serde_json::to_string(&ExportBundle { version: 2, products, employees })
         .map_err(|e| e.to_string())
 }
 
-/// Replace the entire database with data from a previously exported JSON string.
 #[tauri::command]
 async fn import_data(state: State<'_, AppState>, json: String) -> Result<(), String> {
     let bundle: ExportBundle = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-    let db = state.db.lock().await;
 
-    // ── Products ──────────────────────────────────────────────────────────────
-    let table_names = db.table_names().execute().await.map_err(|e| e.to_string())?;
-    if table_names.contains(&TABLE_NAME.to_string()) {
-        db.drop_table(TABLE_NAME).await.map_err(|e| e.to_string())?;
-    }
-    let schema = product_schema();
-    let empty  = RecordBatch::new_empty(schema.clone());
-    let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-    let prod_table = db.create_table(TABLE_NAME, Box::new(reader))
-        .execute().await.map_err(|e| e.to_string())?;
-    if !bundle.products.is_empty() {
-        let batch  = products_to_batch(&bundle.products)?;
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-        prod_table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
+    {
+        let db = state.db.lock().await;
+        db.execute_batch("DELETE FROM products; DELETE FROM employees;")
+            .map_err(|e| e.to_string())?;
     }
 
-    // ── Employees ─────────────────────────────────────────────────────────────
-    if table_names.contains(&EMPLOYEE_TABLE.to_string()) {
-        db.drop_table(EMPLOYEE_TABLE).await.map_err(|e| e.to_string())?;
+    for p in bundle.products {
+        add_product(state.clone(), p).await?;
     }
-    let schema = employee_schema();
-    let empty  = RecordBatch::new_empty(schema.clone());
-    let reader = RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
-    let emp_table = db.create_table(EMPLOYEE_TABLE, Box::new(reader))
-        .execute().await.map_err(|e| e.to_string())?;
-    if !bundle.employees.is_empty() {
-        let batch  = employees_to_batch(&bundle.employees)?;
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-        emp_table.add(Box::new(reader)).execute().await.map_err(|e| e.to_string())?;
+    for e in bundle.employees {
+        add_employee(state.clone(), e).await?;
     }
-
     Ok(())
+}
+
+// ── CQRS command log helpers ──────────────────────────────────────────────────
+
+fn log_command(
+    db: &Connection,
+    device_id: &str,
+    cmd: &str,
+    args: serde_json::Value,
+) -> Result<(), String> {
+    let id = Uuid::new_v4().to_string();
+    let ts = {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}", d.as_millis())
+    };
+    db.execute(
+        "INSERT INTO command_log (id, ts, device_id, cmd, args) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            id, ts, device_id, cmd,
+            serde_json::to_string(&args).map_err(|e| e.to_string())?
+        ],
+    ).map_err(|e| e.to_string()).map(|_| ())
+}
+
+fn apply_command(
+    db: &Connection,
+    cmd: &str,
+    args: &serde_json::Value,
+) -> Result<(), String> {
+    match cmd {
+        "ADD_PRODUCT" | "UPDATE_PRODUCT" | "SELL_PRODUCT" => {
+            let id = args["id"].as_str().unwrap_or("");
+            let brand = args["brand"].as_str().unwrap_or("");
+            let source_language = args["sourceLanguage"].as_str().unwrap_or("");
+            let name = args["name"].as_str().unwrap_or("");
+            let category = args["category"].as_str().unwrap_or("Food & Beverage");
+            let supplier_id = args["supplierId"].as_str().unwrap_or("");
+            let manufacture_date = args["manufactureDate"].as_str().unwrap_or("N/A");
+            let expiry_date = args["expiryDate"].as_str().unwrap_or("N/A");
+            let image_location = serde_json::to_string(&args["imageLocation"]).unwrap_or_else(|_| "[]".into());
+            let quantity = args["quantity"].as_i64().unwrap_or(0) as i32;
+            let sold_quantity = args["soldQuantity"].as_i64().unwrap_or(0) as i32;
+            let buy_price = args["buyPrice"].as_f64().unwrap_or(0.0);
+            let sell_price = args["sellPrice"].as_f64().unwrap_or(0.0);
+            let sales_history = args["salesHistory"].as_str().unwrap_or("");
+            db.execute(
+                "INSERT INTO products (id, brand, source_language, name, category, supplier_id,
+                 manufacture_date, expiry_date, image_location, quantity, sold_quantity,
+                 buy_price, sell_price, images_json, sales_history, embedding)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,
+                   COALESCE((SELECT images_json FROM products WHERE id=?1), '[]'),
+                   ?14,
+                   COALESCE((SELECT embedding FROM products WHERE id=?1), X''))
+                 ON CONFLICT(id) DO UPDATE SET
+                   brand=excluded.brand, source_language=excluded.source_language,
+                   name=excluded.name, category=excluded.category,
+                   supplier_id=excluded.supplier_id,
+                   manufacture_date=excluded.manufacture_date, expiry_date=excluded.expiry_date,
+                   image_location=excluded.image_location, quantity=excluded.quantity,
+                   sold_quantity=excluded.sold_quantity, buy_price=excluded.buy_price,
+                   sell_price=excluded.sell_price, sales_history=excluded.sales_history",
+                rusqlite::params![
+                    id, brand, source_language, name, category, supplier_id,
+                    manufacture_date, expiry_date, image_location,
+                    quantity, sold_quantity, buy_price, sell_price, sales_history,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        "DELETE_PRODUCT" => {
+            let id = args["id"].as_str().unwrap_or("");
+            db.execute("DELETE FROM products WHERE id=?1", rusqlite::params![id])
+                .map_err(|e| e.to_string())?;
+        }
+        "ADD_EMPLOYEE" | "UPDATE_EMPLOYEE" | "CHECKIN_EMPLOYEE" => {
+            let id = args["id"].as_str().unwrap_or("");
+            let name = args["name"].as_str().unwrap_or("");
+            let photo = args["photo"].as_str().unwrap_or("");
+            let salary = args["salary"].as_f64().unwrap_or(0.0);
+            let salary_type = args["salaryType"].as_str().unwrap_or("monthly");
+            let dob = args["dob"].as_str().unwrap_or("N/A");
+            let joining_date = args["joiningDate"].as_str().unwrap_or("N/A");
+            let mobile_number = args["mobileNumber"].as_str().unwrap_or("");
+            let check_in_days = args["checkInDays"].as_i64().unwrap_or(0) as i32;
+            let last_check_in = args["lastCheckIn"].as_str().unwrap_or("N/A");
+            let check_in_history = args["checkInHistory"].as_str().unwrap_or("");
+            let salary_history = args["salaryHistory"].as_str().unwrap_or("[]");
+            db.execute(
+                "INSERT INTO employees (id, name, photo, salary, salary_type, dob, joining_date,
+                 mobile_number, check_in_days, last_check_in, check_in_history, salary_history)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                 ON CONFLICT(id) DO UPDATE SET
+                   name=excluded.name, photo=excluded.photo, salary=excluded.salary,
+                   salary_type=excluded.salary_type, dob=excluded.dob,
+                   joining_date=excluded.joining_date, mobile_number=excluded.mobile_number,
+                   check_in_days=excluded.check_in_days, last_check_in=excluded.last_check_in,
+                   check_in_history=excluded.check_in_history, salary_history=excluded.salary_history",
+                rusqlite::params![
+                    id, name, photo, salary, salary_type, dob, joining_date,
+                    mobile_number, check_in_days, last_check_in, check_in_history, salary_history,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        "DELETE_EMPLOYEE" => {
+            let id = args["id"].as_str().unwrap_or("");
+            db.execute("DELETE FROM employees WHERE id=?1", rusqlite::params![id])
+                .map_err(|e| e.to_string())?;
+        }
+        "ADD_SUPPLIER" => {
+            let id = args["id"].as_str().unwrap_or("");
+            let name = args["name"].as_str().unwrap_or("");
+            let phone = args["phone"].as_str().unwrap_or("");
+            db.execute(
+                "INSERT OR IGNORE INTO suppliers (id, name, phone) VALUES (?1,?2,?3)",
+                rusqlite::params![id, name, phone],
+            ).map_err(|e| e.to_string())?;
+        }
+        "DELETE_SUPPLIER" => {
+            let id = args["id"].as_str().unwrap_or("");
+            db.execute("DELETE FROM suppliers WHERE id=?1", rusqlite::params![id])
+                .map_err(|e| e.to_string())?;
+        }
+        _ => {} // unknown command type, ignore
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn push_events(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let session = match auth::load_session(&app_data) {
+        None => return Ok(0),
+        Some(s) => auth::ensure_valid_token(&app_data, s).await?,
+    };
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LogRow { id: String, ts: String, device_id: String, cmd: String, args: String }
+
+    let rows: Vec<LogRow> = {
+        let db = state.db.lock().await;
+        let mut stmt = db
+            .prepare("SELECT id, ts, device_id, cmd, args FROM command_log WHERE pushed = 0 ORDER BY ts")
+            .map_err(|e| e.to_string())?;
+        let result = stmt.query_map([], |row| {
+            Ok(LogRow {
+                id: row.get(0)?, ts: row.get(1)?,
+                device_id: row.get(2)?, cmd: row.get(3)?, args: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+        result
+    };
+
+    if rows.is_empty() { return Ok(0); }
+
+    let count = rows.len() as u32;
+    let jsonl = rows.iter()
+        .filter_map(|r| serde_json::to_string(r).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let batch_id = Uuid::new_v4().to_string();
+    let file_name = format!("cmd_{}_{}.jsonl", state.device_id, batch_id);
+    drive::upload_command_batch(&session.access_token, &file_name, jsonl.into_bytes()).await?;
+
+    {
+        let db = state.db.lock().await;
+        db.execute("UPDATE command_log SET pushed = 1 WHERE pushed = 0", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(count)
+}
+
+#[tauri::command]
+async fn pull_events(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let session = match auth::load_session(&app_data) {
+        None => return Ok(0),
+        Some(s) => auth::ensure_valid_token(&app_data, s).await?,
+    };
+
+    let all_files = drive::list_command_files(&session.access_token).await?;
+
+    let to_apply: Vec<(String, String)> = {
+        let db = state.db.lock().await;
+        all_files.into_iter()
+            .filter(|(name, _)| !name.contains(&state.device_id))
+            .filter(|(name, _)| {
+                db.query_row(
+                    "SELECT 1 FROM applied_batches WHERE id = ?1",
+                    rusqlite::params![name],
+                    |_| Ok(()),
+                ).is_err()
+            })
+            .collect()
+    };
+
+    if to_apply.is_empty() { return Ok(0); }
+
+    #[derive(serde::Deserialize)]
+    struct LogRow { id: String, cmd: String, args: String }
+
+    let mut total_applied = 0u32;
+
+    for (file_name, file_id) in &to_apply {
+        let jsonl = drive::download_command_file(&session.access_token, file_id).await?;
+
+        for line in jsonl.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let row: LogRow = match serde_json::from_str(line) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let args: serde_json::Value = serde_json::from_str(&row.args).unwrap_or_default();
+
+            {
+                let db = state.db.lock().await;
+                if db.query_row(
+                    "SELECT 1 FROM applied_batches WHERE id = ?1",
+                    rusqlite::params![&row.id],
+                    |_| Ok(()),
+                ).is_ok() { continue; }
+
+                apply_command(&db, &row.cmd, &args)?;
+
+                db.execute(
+                    "INSERT OR IGNORE INTO applied_batches (id) VALUES (?1)",
+                    rusqlite::params![&row.id],
+                ).map_err(|e| e.to_string())?;
+            }
+            total_applied += 1;
+        }
+
+        let db = state.db.lock().await;
+        db.execute(
+            "INSERT OR IGNORE INTO applied_batches (id) VALUES (?1)",
+            rusqlite::params![file_name],
+        ).map_err(|e| e.to_string())?;
+    }
+
+    Ok(total_applied)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1074,22 +965,43 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let db_path = app
+            let app_data_dir = app
                 .path()
                 .app_data_dir()
-                .expect("failed to resolve app data dir")
-                .join("store.lancedb");
+                .expect("failed to resolve app data dir");
+            let db_path = app_data_dir.join("store.db");
 
-            let db = tauri::async_runtime::block_on(async {
-                connect(db_path.to_str().unwrap())
-                    .execute()
-                    .await
-                    .expect("failed to connect to LanceDB")
-            });
+            let conn = Connection::open(&db_path).expect("failed to open SQLite database");
+            init_db(&conn).expect("failed to initialise database schema");
 
-            // Spawn PaddleOCR daemon in a background OS thread so the app window
-            // opens immediately. The daemon loads the model (~5-8s) while the user
-            // is already looking at the UI.
+            let device_id_path = app_data_dir.join("device_id.txt");
+            let device_id = std::fs::read_to_string(&device_id_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    let id = Uuid::new_v4().to_string();
+                    let _ = std::fs::write(&device_id_path, &id);
+                    id
+                });
+            // Migrations: add new columns to existing databases (silently ignored if already exist)
+            let _ = conn.execute_batch(
+                "ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT 'Food & Beverage';"
+            );
+            let _ = conn.execute_batch(
+                "ALTER TABLE products ADD COLUMN supplier_id TEXT NOT NULL DEFAULT '';"
+            );
+
+            // Load the embedding model in a background thread so the UI appears immediately.
+            // AllMiniLML6V2Q is downloaded once (~23 MB) and cached; subsequent runs are instant.
+            let embedder: Arc<Mutex<TextEmbedding>> = Arc::new(Mutex::new(
+                TextEmbedding::try_new(
+                    InitOptions::new(EmbeddingModel::AllMiniLML6V2Q)
+                        .with_show_download_progress(false),
+                )
+                .expect("failed to initialise embedding model"),
+            ));
+
             let paddle: Arc<Mutex<Option<PaddleDaemon>>> = Arc::new(Mutex::new(None));
             let paddle_bg = Arc::clone(&paddle);
             std::thread::spawn(move || {
@@ -1097,7 +1009,8 @@ pub fn run() {
                     paddle_bg.blocking_lock().replace(d);
                 }
             });
-            app.manage(AppState { db: Mutex::new(db), paddle });
+
+            app.manage(AppState { db: Mutex::new(conn), embedder, paddle, device_id });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1112,8 +1025,20 @@ pub fn run() {
             update_employee,
             delete_employee,
             checkin_employee,
+            get_suppliers,
+            add_supplier,
+            delete_supplier,
             export_data,
             import_data,
+            auth::check_credentials,
+            auth::save_credentials,
+            auth::start_oauth,
+            auth::get_session,
+            auth::sign_out,
+            drive::drive_push,
+            drive::drive_pull,
+            push_events,
+            pull_events,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

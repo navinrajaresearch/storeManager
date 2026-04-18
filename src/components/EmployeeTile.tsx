@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { User, Calendar, BadgeDollarSign, Clock, Phone, Pencil, LogIn } from "lucide-react";
+import { User, Calendar, BadgeDollarSign, Clock, Phone, Pencil, LogIn, RefreshCw } from "lucide-react";
 import type { Employee } from "../types";
 import { playTick } from "../utils/sound";
 
@@ -9,15 +9,25 @@ interface Props {
   onDelete?: (id: string) => void;
   onEdit?: (employee: Employee) => void;
   onCheckIn?: (id: string, hours?: number) => void;
+  onRefresh?: (id: string) => void;
 }
 
-export function EmployeeTile({ employee, onDelete, onEdit, onCheckIn }: Props) {
+export function EmployeeTile({ employee, onDelete, onEdit, onCheckIn, onRefresh }: Props) {
   const [flipped, setFlipped] = useState(false);
   const [checkingIn, setCheckingIn] = useState(false);
   const [hours, setHours] = useState("");
 
   const today = new Date().toISOString().slice(0, 10);
   const checkedInToday = employee.lastCheckIn === today;
+
+  // Parse today's stored hours for hourly employees (to prepopulate the input)
+  const todayStoredHours = (() => {
+    if (employee.salaryType !== "hourly") return 0;
+    const entry = employee.checkInHistory.split(",").find((e) => e.startsWith(today + ":"));
+    if (!entry) return 0;
+    const h = parseFloat(entry.slice(today.length + 1));
+    return isNaN(h) ? 0 : h;
+  })();
 
   const initials = employee.name
     .split(" ")
@@ -144,7 +154,8 @@ export function EmployeeTile({ employee, onDelete, onEdit, onCheckIn }: Props) {
                     onClick={(e) => {
                       e.stopPropagation();
                       playTick();
-                      onCheckIn(employee.id, parseFloat(hours) || undefined);
+                      const h = parseFloat(hours);
+                      onCheckIn(employee.id, isNaN(h) || h <= 0 ? undefined : h);
                       setCheckingIn(false);
                       setHours("");
                     }}
@@ -165,6 +176,8 @@ export function EmployeeTile({ employee, onDelete, onEdit, onCheckIn }: Props) {
                     e.stopPropagation();
                     playTick();
                     if (employee.salaryType === "hourly") {
+                      // Prepopulate with today's stored hours if already checked in
+                      setHours(todayStoredHours > 0 ? String(todayStoredHours) : "");
                       setCheckingIn(true);
                     } else {
                       onCheckIn(employee.id);
@@ -173,7 +186,9 @@ export function EmployeeTile({ employee, onDelete, onEdit, onCheckIn }: Props) {
                   className="w-full flex items-center justify-center gap-1 text-[10px] text-emerald-600 hover:text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg py-1 transition-colors"
                 >
                   <LogIn className="w-2.5 h-2.5" />
-                  {checkedInToday ? "Checked in ✓" : "Check in"}
+                  {checkedInToday && employee.salaryType === "hourly" && todayStoredHours > 0
+                    ? `Checked in ✓ (${todayStoredHours}h)`
+                    : checkedInToday ? "Checked in ✓" : "Check in"}
                 </button>
               )}
             </div>
@@ -186,6 +201,15 @@ export function EmployeeTile({ employee, onDelete, onEdit, onCheckIn }: Props) {
                 className="flex-1 flex items-center justify-center gap-1 text-[10px] text-indigo-400 hover:text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg py-1 transition-colors"
               >
                 <Pencil className="w-2.5 h-2.5" /> Edit
+              </button>
+            )}
+            {onRefresh && (
+              <button
+                onClick={(e) => { e.stopPropagation(); playTick(); onRefresh(employee.id); }}
+                className="flex items-center justify-center gap-1 text-[10px] text-sky-400 hover:text-sky-600 bg-sky-50 hover:bg-sky-100 rounded-lg py-1 px-2 transition-colors"
+                title="Refresh employee data"
+              >
+                <RefreshCw className="w-2.5 h-2.5" />
               </button>
             )}
             {onDelete && (

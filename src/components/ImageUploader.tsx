@@ -54,7 +54,7 @@ export function ImageUploader({ onImagesReady, onOcrDone, onManual }: Props) {
       .then(({ parsed, rawText }) => onOcrDone(parsed, rawText))
       .catch(() => onOcrDone(
         { brand: "", name: "", sourceLanguage: "", manufactureDate: "N/A",
-          expiryDate: "N/A", buyPrice: 0, sellPrice: 0, quantity: 0, soldQuantity: 0 },
+          expiryDate: "N/A", buyPrice: 0, sellPrice: 0, quantity: 0, soldQuantity: 0, salesHistory: "", category: "Food & Beverage", supplierId: "" },
         ""
       ));
   }

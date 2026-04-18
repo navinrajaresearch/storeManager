@@ -1,25 +1,28 @@
 import { useState, useEffect } from "react";
-import { Check, X, ChevronDown, ChevronUp } from "lucide-react";
-import type { NewProduct } from "../types";
+import { Check, X, ChevronDown, ChevronUp, Plus } from "lucide-react";
+import type { NewProduct, Supplier } from "../types";
 import { CATEGORIES } from "../types";
 import { playPop } from "../utils/sound";
-
 
 interface Props {
   product: Partial<NewProduct>;
   images: string[];
   imageNames: string[];
   scanning?: boolean;
+  suppliers: Supplier[];
   onConfirm: (p: NewProduct) => void;
   onCancel: () => void;
+  onAddSupplier: (name: string, phone: string) => Promise<Supplier>;
 }
 
-export function ProductConfirm({ product, images, imageNames, scanning, onConfirm, onCancel }: Props) {
+export function ProductConfirm({ product, images, imageNames, scanning, suppliers, onConfirm, onCancel, onAddSupplier }: Props) {
   const [showRaw, setShowRaw] = useState(false);
   const [form, setForm] = useState<NewProduct>({
     brand:           product.brand           ?? "",
     sourceLanguage:  product.sourceLanguage  ?? "",
     name:            product.name            ?? "",
+    category:        product.category        ?? "Food & Beverage",
+    supplierId:      product.supplierId      ?? "",
     manufactureDate: product.manufactureDate ?? "N/A",
     expiryDate:      product.expiryDate      ?? "N/A",
     imageLocation:   imageNames,
@@ -27,8 +30,15 @@ export function ProductConfirm({ product, images, imageNames, scanning, onConfir
     soldQuantity:    product.soldQuantity    ?? 0,
     buyPrice:        product.buyPrice        ?? 0,
     sellPrice:       product.sellPrice       ?? 0,
+    salesHistory:    product.salesHistory    ?? "",
     images,
   });
+
+  // Inline add-supplier state
+  const [addingSupplier, setAddingSupplier] = useState(false);
+  const [newSupplierName, setNewSupplierName] = useState("");
+  const [newSupplierPhone, setNewSupplierPhone] = useState("");
+  const [savingSupplier, setSavingSupplier] = useState(false);
 
   // When OCR finishes (scanning flips false), pull in the populated fields
   useEffect(() => {
@@ -60,6 +70,31 @@ export function ProductConfirm({ product, images, imageNames, scanning, onConfir
         {node}
       </div>
     );
+  }
+
+  async function handleSaveSupplier() {
+    const name = newSupplierName.trim();
+    if (!name) return;
+    setSavingSupplier(true);
+    try {
+      const created = await onAddSupplier(name, newSupplierPhone.trim());
+      setForm((f) => ({ ...f, supplierId: created.id }));
+      setAddingSupplier(false);
+      setNewSupplierName("");
+      setNewSupplierPhone("");
+    } finally {
+      setSavingSupplier(false);
+    }
+  }
+
+  function handleSupplierSelect(value: string) {
+    if (value === "__add__") {
+      setAddingSupplier(true);
+      setForm((f) => ({ ...f, supplierId: "" }));
+    } else {
+      setAddingSupplier(false);
+      setForm((f) => ({ ...f, supplierId: value }));
+    }
   }
 
   return (
@@ -99,13 +134,9 @@ export function ProductConfirm({ product, images, imageNames, scanning, onConfir
         )}
 
         <div className="grid grid-cols-2 gap-2">
-          {field("Source language",
-            <input className={`${inp} ${shimmer}`} value={form.sourceLanguage}
-              onChange={(e) => setForm({ ...form, sourceLanguage: e.target.value })} />
-          )}
           {field("Category",
-            <select className={inp} value={(form as NewProduct & { category?: string }).category ?? "Other"}
-              onChange={(e) => setForm({ ...form, ...({"category": e.target.value} as Record<string, unknown>) as Partial<NewProduct> })}>
+            <select className={inp} value={form.category ?? "Food & Beverage"}
+              onChange={(e) => setForm({ ...form, category: e.target.value })}>
               {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
             </select>
           )}
@@ -118,6 +149,59 @@ export function ProductConfirm({ product, images, imageNames, scanning, onConfir
               onChange={(e) => setForm({ ...form, expiryDate: e.target.value })} />
           )}
         </div>
+      </div>
+
+      {/* Supplier */}
+      <div className="bg-violet-50 border border-violet-100 rounded-xl p-3 flex flex-col gap-2">
+        <p className="text-[10px] text-violet-600 uppercase tracking-wider font-medium">Supplier</p>
+        {field("",
+          <select
+            className={inp.replace("border-amber-200", "border-violet-200").replace("focus:border-orange-400", "focus:border-violet-400")}
+            value={addingSupplier ? "__add__" : (form.supplierId || "")}
+            onChange={(e) => handleSupplierSelect(e.target.value)}
+          >
+            <option value="">— None —</option>
+            {suppliers.map((s) => (
+              <option key={s.id} value={s.id}>{s.name}{s.phone ? ` (${s.phone})` : ""}</option>
+            ))}
+            <option value="__add__">＋ Add new supplier…</option>
+          </select>
+        )}
+
+        {addingSupplier && (
+          <div className="flex flex-col gap-1.5 pt-1 border-t border-violet-100">
+            <input
+              autoFocus
+              className={inp.replace("border-amber-200", "border-violet-200").replace("focus:border-orange-400", "focus:border-violet-400")}
+              placeholder="Supplier name *"
+              value={newSupplierName}
+              onChange={(e) => setNewSupplierName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleSaveSupplier()}
+            />
+            <input
+              className={inp.replace("border-amber-200", "border-violet-200").replace("focus:border-orange-400", "focus:border-violet-400")}
+              placeholder="Phone (optional)"
+              value={newSupplierPhone}
+              onChange={(e) => setNewSupplierPhone(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleSaveSupplier()}
+            />
+            <div className="flex gap-1.5">
+              <button
+                disabled={!newSupplierName.trim() || savingSupplier}
+                onClick={handleSaveSupplier}
+                className="flex items-center gap-1 px-3 py-1 bg-violet-500 hover:bg-violet-600 disabled:opacity-40 text-white text-xs rounded-lg transition-colors"
+              >
+                <Plus className="w-3 h-3" /> {savingSupplier ? "Saving…" : "Add"}
+              </button>
+              <button
+                onClick={() => { setAddingSupplier(false); setNewSupplierName(""); setNewSupplierPhone(""); }}
+                className="px-3 py-1 text-xs text-gray-500 hover:text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* User-filled */}
@@ -136,14 +220,10 @@ export function ProductConfirm({ product, images, imageNames, scanning, onConfir
             <input type="number" min={0} className={inp} value={form.quantity}
               onChange={(e) => setForm({ ...form, quantity: parseInt(e.target.value) || 0 })} />
           )}
-          {field("Sold qty",
-            <input type="number" min={0} className={inp} value={form.soldQuantity}
-              onChange={(e) => setForm({ ...form, soldQuantity: parseInt(e.target.value) || 0 })} />
-          )}
         </div>
       </div>
 
-      {/* Raw OCR text — collapsible, helps user see what was read */}
+      {/* Raw OCR text — collapsible */}
       {product.rawText && (
         <div className="border border-gray-200 rounded-xl overflow-hidden">
           <button

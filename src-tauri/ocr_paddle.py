@@ -35,10 +35,12 @@ def load_ocr(lang="en"):
     try:
         ocr = PaddleOCR(
             lang=lang,
-            use_angle_cls=False,    # skip rotation classifier — packaging is usually upright
-            det_limit_side_len=960, # cap detection resolution (default can go higher)
-            det_db_thresh=0.3,      # slightly lower threshold → fewer misses
-            show_log=False,
+            text_detection_model_name="PP-OCRv5_mobile_det",  # 20x faster than server model
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,             # product labels are flat, skip unwarping
+            use_textline_orientation=False,
+            text_det_limit_side_len=640,         # product labels don't need high res
+            text_det_thresh=0.3,
         )
     except Exception as e:
         return None, str(e)

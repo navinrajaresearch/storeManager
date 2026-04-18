@@ -23,3 +23,5 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+src-tauri/src/secrets.rs
+src-tauri/.fastembed_cache/

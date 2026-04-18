@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { Cpu, Shirt, Coffee, Home, Dumbbell, BookOpen, Gamepad2, Heart, Car, Package, TrendingUp, TrendingDown, Globe, Calendar, Pencil } from "lucide-react";
+import { Cpu, Shirt, Coffee, Home, Dumbbell, BookOpen, Gamepad2, Heart, Car, Package, TrendingUp, TrendingDown, Calendar, Pencil, ShoppingCart } from "lucide-react";
 import type { Product } from "../types";
 import { calcBuySellAmt } from "../types";
 import { playTick } from "../utils/sound";
@@ -24,29 +24,18 @@ const CAT_ICON: Record<string, React.ComponentType<{ className?: string }>> = {
   Toys: Gamepad2, "Health & Beauty": Heart, Automotive: Car, Other: Package,
 };
 
-function detectCategory(brand: string, name: string): string {
-  const text = `${brand} ${name}`.toLowerCase();
-  if (/laptop|phone|tv|camera|headphone|electronic|cpu|gpu/.test(text)) return "Electronics";
-  if (/shirt|dress|jacket|pant|shoe|cloth|wear/.test(text)) return "Clothing";
-  if (/food|drink|beverage|snack|tea|coffee|juice/.test(text)) return "Food & Beverage";
-  if (/home|garden|furniture|decor/.test(text)) return "Home & Garden";
-  if (/sport|gym|fitness|ball|bike/.test(text)) return "Sports";
-  if (/book|novel|magazine/.test(text)) return "Books";
-  if (/toy|game|puzzle/.test(text)) return "Toys";
-  if (/beauty|skincare|shampoo|cosmetic|health|medicine/.test(text)) return "Health & Beauty";
-  if (/car|auto|vehicle|motor/.test(text)) return "Automotive";
-  return "Other";
-}
 
 interface Props {
   product: Product;
+  supplierName?: string;
   onDelete?: (id: string) => void;
   onEdit?: (product: Product) => void;
+  onSell?: (product: Product) => void;
 }
 
-export function ProductTile({ product, onDelete, onEdit }: Props) {
+export function ProductTile({ product, supplierName, onDelete, onEdit, onSell }: Props) {
   const [flipped, setFlipped] = useState(false);
-  const category = detectCategory(product.brand, product.name);
+  const category = product.category || "Food & Beverage";
   const Icon = CAT_ICON[category] ?? Package;
   const gradient = CAT_GRADIENT[category] ?? CAT_GRADIENT.Other;
   const hasImage = product.images.length > 0;
@@ -82,12 +71,6 @@ export function ProductTile({ product, onDelete, onEdit }: Props) {
           <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 via-black/30 to-transparent px-3 pt-8 pb-3">
             {product.brand && <p className="text-white/70 text-[9px] uppercase tracking-wider truncate">{product.brand}</p>}
             <p className="text-white text-xs font-semibold leading-snug truncate">{product.name}</p>
-            {product.sourceLanguage && (
-              <div className="flex items-center gap-1 mt-0.5">
-                <Globe className="w-2.5 h-2.5 text-white/50" />
-                <p className="text-white/50 text-[9px]">{product.sourceLanguage}</p>
-              </div>
-            )}
           </div>
           <div className="absolute top-2 left-2 flex flex-col gap-1">
             {isExpired && <span className="text-[8px] bg-red-500 text-white px-1.5 py-0.5 rounded-full font-medium">Expired</span>}
@@ -132,26 +115,39 @@ export function ProductTile({ product, onDelete, onEdit }: Props) {
               {amtPositive ? "+" : ""}₹{buySellAmt.toFixed(2)}
             </span>
           </div>
+          {supplierName && (
+            <div className="mx-3 mb-1 text-[8px] text-violet-500 truncate">🏪 {supplierName}</div>
+          )}
           {product.imageLocation.length > 0 && (
             <div className="mx-3 mb-1 text-[8px] text-gray-400 truncate">📁 {product.imageLocation.join(", ")}</div>
           )}
-          <div className="mx-3 mb-2.5 flex gap-2">
-            {onEdit && (
+          <div className="mx-3 mb-2.5 flex flex-col gap-1.5">
+            {onSell && product.quantity > 0 && (
               <button
-                onClick={(e) => { e.stopPropagation(); playTick(); onEdit(product); }}
-                className="flex-1 flex items-center justify-center gap-1 text-[10px] text-orange-400 hover:text-orange-600 bg-orange-50 hover:bg-orange-100 rounded-lg py-1 transition-colors"
+                onClick={(e) => { e.stopPropagation(); playTick(); onSell(product); }}
+                className="w-full flex items-center justify-center gap-1 text-[10px] text-emerald-600 hover:text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded-lg py-1.5 font-medium transition-colors"
               >
-                <Pencil className="w-2.5 h-2.5" /> Edit
+                <ShoppingCart className="w-2.5 h-2.5" /> Sell
               </button>
             )}
-            {onDelete && (
-              <button
-                onClick={(e) => { e.stopPropagation(); playTick(); onDelete(product.id); }}
-                className="flex-1 text-[10px] text-red-400 hover:text-red-600 bg-red-50 hover:bg-red-100 rounded-lg py-1 transition-colors"
-              >
-                Delete
-              </button>
-            )}
+            <div className="flex gap-1.5">
+              {onEdit && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); playTick(); onEdit(product); }}
+                  className="flex-1 flex items-center justify-center gap-1 text-[10px] text-orange-400 hover:text-orange-600 bg-orange-50 hover:bg-orange-100 rounded-lg py-1 transition-colors"
+                >
+                  <Pencil className="w-2.5 h-2.5" /> Edit
+                </button>
+              )}
+              {onDelete && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); playTick(); onDelete(product.id); }}
+                  className="flex-1 text-[10px] text-red-400 hover:text-red-600 bg-red-50 hover:bg-red-100 rounded-lg py-1 transition-colors"
+                >
+                  Delete
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </motion.div>

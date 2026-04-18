@@ -11,8 +11,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@lancedb/lancedb": "^0.27.2",
-    "@tailwindcss/vite": "^4.2.2",
+"@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "framer-motion": "^12.38.0",

@@ -12,7 +12,7 @@ export interface OcrResult {
 
 /** Resize + convert to grayscale JPEG in-browser before sending to OCR.
  *  Drops a 4K phone image (~12MB) down to ~150KB — single biggest speedup. */
-async function prepareImage(dataUrl: string, maxDim = 1200): Promise<string> {
+async function prepareImage(dataUrl: string, maxDim = 800): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
@@ -91,6 +91,9 @@ function parseOcrText(raw: string, frontText?: string): Omit<NewProduct, "images
     sellPrice:    0,
     quantity:     0,
     soldQuantity: 0,
+    salesHistory: "",
+    category:     "Food & Beverage",
+    supplierId:   "",
   };
 }
 

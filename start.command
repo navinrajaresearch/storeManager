@@ -39,12 +39,12 @@ if ! command -v brew &>/dev/null; then
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 
-# ── Protobuf compiler (required by LanceDB) ───────────────
-if ! command -v protoc &>/dev/null; then
-  echo "→ Installing protobuf compiler…"
-  brew install protobuf
+# ── ONNX Runtime (required by fastembed for semantic search) ──────────────────
+if ! brew list onnxruntime &>/dev/null; then
+  echo "→ Installing ONNX Runtime (needed for semantic search)…"
+  brew install onnxruntime
 else
-  echo "✓ protoc $(protoc --version 2>/dev/null)"
+  echo "✓ ONNX Runtime $(brew info --json onnxruntime | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["versions"]["stable"])' 2>/dev/null)"
 fi
 
 # ── Python 3 — prefer Homebrew's own Python (writable) over system Python ─────
@@ -60,7 +60,7 @@ else
 fi
 echo "✓ Python $($PYTHON --version 2>&1 | cut -d' ' -f2)  [$PYTHON]"
 
-# ── PaddleOCR — install into a project-local .venv to avoid PEP 668 issues ────
+# ── PaddleOCR — install into a project-local .venv ────────────────────────────
 VENV_DIR="$(pwd)/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python3"
 
@@ -76,33 +76,19 @@ if ! "$VENV_PYTHON" -c "import paddleocr" 2>/dev/null; then
   if "$VENV_PYTHON" -c "import paddleocr" 2>/dev/null; then
     echo "✓ PaddleOCR installed"
   else
-    echo "⚠ PaddleOCR install failed — will fall back to Tesseract for scanning"
+    echo "⚠ PaddleOCR install failed — image scanning will be unavailable"
   fi
 else
   echo "✓ PaddleOCR ready"
 fi
 
-# ── Tesseract OCR (fallback if PaddleOCR fails) ────────────────────────────────
-if ! command -v tesseract &>/dev/null; then
-  echo "→ Installing Tesseract OCR (fallback scanner)…"
-  brew install tesseract
-else
-  echo "✓ Tesseract $(tesseract --version 2>&1 | head -1 | cut -d' ' -f2) (fallback)"
-fi
-
-# ── Tesseract language packs ───────────────────────────────────────────────────
-TESSDATA_DIR="$(brew --prefix)/share/tessdata"
-MISSING_LANGS=()
-for lang in hin tam tel; do
-  [ ! -f "$TESSDATA_DIR/${lang}.traineddata" ] && MISSING_LANGS+=("$lang")
-done
-if [ ${#MISSING_LANGS[@]} -gt 0 ]; then
-  brew install tesseract-lang
-fi
-
-# Ensure Homebrew binaries (protoc, pkg-config, etc.) are on PATH
+# Ensure Homebrew binaries are on PATH
 export PATH="$(brew --prefix)/bin:$(brew --prefix)/sbin:${PATH}"
 export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# Export ORT location for Rust build (fastembed uses system ONNX Runtime)
+export ORT_STRATEGY=system
+export ORT_LIB_LOCATION="$(brew --prefix)/opt/onnxruntime"
 
 # ── Dependencies ──────────────────────────────────
 echo ""
@@ -112,5 +98,6 @@ npm install
 # ── Launch ────────────────────────────────────────
 echo ""
 echo "→ Starting Store Manager…"
+echo "  (First launch downloads the ~23 MB embedding model — internet needed once)"
 echo ""
 npm run tauri dev

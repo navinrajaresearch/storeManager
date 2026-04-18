@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ArrowLeft, Download, Share2 } from "lucide-react";
+import { useState, useEffect } from "react";
+import { ArrowLeft, Download, Share2, X } from "lucide-react";
 import type { Employee } from "../types";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -23,8 +23,9 @@ function parseCheckInHistory(raw: string): { date: string; hours: number }[] {
   if (!raw) return [];
   return raw.split(",").filter(Boolean).map((entry) => {
     const colon = entry.indexOf(":");
-    if (colon === -1) return { date: entry, hours: 8 };
-    return { date: entry.slice(0, colon), hours: parseFloat(entry.slice(colon + 1)) || 8 };
+    if (colon === -1) return { date: entry, hours: 0 };
+    const h = parseFloat(entry.slice(colon + 1));
+    return { date: entry.slice(0, colon), hours: isNaN(h) ? 0 : h };
   });
 }
 
@@ -78,6 +79,26 @@ function calcPeriod(
       return { employee: e, days: entries.length, totalHours, dailyRate: avgDailyRate, total };
     })
     .filter((r) => r.days > 0);
+}
+
+interface DayDetail {
+  date: string;
+  hours: number;
+  salary: number;
+  pay: number;
+}
+
+function getDayDetails(result: EmployeeResult, startDate: string, endDate: string): DayDetail[] {
+  const e = result.employee;
+  const history = parseCheckInHistory(e.checkInHistory);
+  return history
+    .filter((h) => h.date >= startDate && h.date <= endDate)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((h) => {
+      const salary = getSalaryAmountForDate(e, h.date);
+      const pay = e.salaryType === "hourly" ? salary * h.hours : salary / 30;
+      return { date: h.date, hours: h.hours, salary, pay };
+    });
 }
 
 // ── Export helpers ────────────────────────────────────────────────────────────
@@ -134,6 +155,14 @@ export function SalaryPeriodWidget({ employees }: Props) {
   const [periodLabel, setPeriodLabel] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [drillEmployee, setDrillEmployee] = useState<EmployeeResult | null>(null);
+
+  // Recalculate when employees prop updates (e.g. after a new check-in)
+  useEffect(() => {
+    if (view === "results" && startDate && endDate) {
+      setResults(calcPeriod(employees, startDate, endDate));
+    }
+  }, [employees]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleToday() {
     const today = new Date().toISOString().slice(0, 10);
@@ -203,7 +232,7 @@ export function SalaryPeriodWidget({ employees }: Props) {
       {/* Header row */}
       <div className="flex items-center justify-between gap-2">
         <button
-          onClick={() => setView("picker")}
+          onClick={() => { setView("picker"); setDrillEmployee(null); }}
           className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 transition-colors"
         >
           <ArrowLeft className="w-3 h-3" />
@@ -211,6 +240,50 @@ export function SalaryPeriodWidget({ employees }: Props) {
         </button>
         <span className="text-[11px] text-gray-500 font-medium truncate">{periodLabel}</span>
       </div>
+
+      {/* Drill-down panel */}
+      {drillEmployee && (
+        <div className="rounded-xl border border-indigo-100 bg-indigo-50/40 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-semibold text-indigo-700">{drillEmployee.employee.name} — daily breakdown</span>
+            <button onClick={() => setDrillEmployee(null)} className="text-gray-400 hover:text-gray-600">
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-gray-400 uppercase tracking-wide">
+                <th className="text-left py-1">Date</th>
+                {drillEmployee.employee.salaryType === "hourly" && <th className="text-right py-1">Hours</th>}
+                <th className="text-right py-1">Rate</th>
+                <th className="text-right py-1">Pay</th>
+              </tr>
+            </thead>
+            <tbody>
+              {getDayDetails(drillEmployee, startDate, endDate).map((d) => (
+                <tr key={d.date} className="border-t border-indigo-100">
+                  <td className="py-1 text-gray-700">{d.date}</td>
+                  {drillEmployee.employee.salaryType === "hourly" && (
+                    <td className="py-1 text-right text-gray-600">{d.hours}h</td>
+                  )}
+                  <td className="py-1 text-right text-gray-600">
+                    {drillEmployee.employee.salaryType === "hourly"
+                      ? `₹${d.salary.toFixed(2)}/hr`
+                      : `₹${d.salary.toFixed(2)}/mo`}
+                  </td>
+                  <td className="py-1 text-right font-medium text-emerald-700">₹{d.pay.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="border-t border-indigo-200">
+                <td colSpan={drillEmployee.employee.salaryType === "hourly" ? 3 : 2} className="py-1 font-semibold text-indigo-700">Total</td>
+                <td className="py-1 text-right font-bold text-emerald-700">₹{drillEmployee.total.toFixed(2)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
 
       {results.length === 0 ? (
         <p className="text-xs text-gray-500 py-2">
@@ -233,7 +306,14 @@ export function SalaryPeriodWidget({ employees }: Props) {
               <tbody>
                 {results.map((r) => (
                   <tr key={r.employee.id} className="border-t border-amber-50 hover:bg-amber-50/40">
-                    <td className="px-3 py-2 font-medium text-gray-800">{r.employee.name}</td>
+                    <td className="px-3 py-2 font-medium">
+                      <button
+                        onClick={() => setDrillEmployee(drillEmployee?.employee.id === r.employee.id ? null : r)}
+                        className="text-indigo-600 hover:text-indigo-800 hover:underline text-left"
+                      >
+                        {r.employee.name}
+                      </button>
+                    </td>
                     <td className="px-3 py-2 text-right text-gray-600">{r.days}</td>
                     <td className="px-3 py-2 text-right text-gray-600">
                       {r.employee.salaryType === "hourly" ? `${r.totalHours}h` : "—"}
@@ -251,7 +331,7 @@ export function SalaryPeriodWidget({ employees }: Props) {
               </tbody>
               <tfoot>
                 <tr className="border-t-2 border-amber-200 bg-amber-50">
-                  <td colSpan={3} className="px-3 py-2 text-xs font-bold text-gray-700">
+                  <td colSpan={4} className="px-3 py-2 text-xs font-bold text-gray-700">
                     Total payout
                   </td>
                   <td className="px-3 py-2 text-right text-sm font-bold text-orange-600">

@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Store, BookOpen, Download, Upload } from "lucide-react";
+import { Store, BookOpen, Cloud, CloudOff, Loader2, LogOut } from "lucide-react";
+import { type Session, checkCredentials, getSession, startOAuth, signOut, pushEvents, pullEvents } from "./lib/auth";
+import { LoginScreen } from "./components/LoginScreen";
+import { SetupScreen } from "./components/SetupScreen";
 
-import type { ChatMessage, Product, NewProduct, NewEmployee, Employee } from "./types";
+import type { ChatMessage, Product, NewProduct, NewEmployee, Employee, Supplier } from "./types";
+import { calcBuySellAmt } from "./types";
 import { processCommand } from "./lib/commands";
-import { invoke } from "@tauri-apps/api/core";
 import { addProduct, deleteProduct, updateProduct, getProducts } from "./lib/db";
-import { addEmployee, deleteEmployee, updateEmployee, checkinEmployee } from "./lib/employeeDb";
+import { addEmployee, deleteEmployee, updateEmployee, checkinEmployee, getEmployees } from "./lib/employeeDb";
+import { getSuppliers, addSupplier } from "./lib/supplierDb";
 import { nanoid } from "./utils/nanoid";
 import { playClick, playPop } from "./utils/sound";
 
@@ -25,6 +29,9 @@ import { ProductChartWidget } from "./components/ProductChartWidget";
 import { BrandLoader } from "./components/BrandLoader";
 import { SalaryPeriodWidget } from "./components/SalaryPeriodWidget";
 import { SalesTrendWidget } from "./components/SalesTrendWidget";
+import { CalculatorWidget } from "./components/CalculatorWidget";
+import { SupplierReportWidget } from "./components/SupplierReportWidget";
+import { SellWidget } from "./components/SellWidget";
 import "./index.css";
 
 // ── markdown-lite renderer ────────────────────────────────────────────────────
@@ -96,13 +103,108 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>(() => [buildWelcome()]);
   const [busy, setBusy] = useState(false);
   const [showReadme, setShowReadme] = useState(false);
-  const [importing, setImporting] = useState(false);
-  const importRef = useRef<HTMLInputElement>(null);
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  type AuthState = "loading" | "setup" | "unauthenticated" | Session;
+  type SyncState = "idle" | "pending" | "syncing" | "synced" | "error";
+
+  const [authState, setAuthState] = useState<AuthState>("loading");
+  const [syncState, setSyncState] = useState<SyncState>("idle");
+  const [lastSynced, setLastSynced] = useState<Date | null>(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    getSuppliers().then(setSuppliers).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    checkCredentials()
+      .then(async (hasCredentials) => {
+        if (!hasCredentials) { setAuthState("setup"); return; }
+        const session = await getSession();
+        if (!session) { setAuthState("unauthenticated"); return; }
+        setAuthState(session);
+        setSyncState("syncing");
+        try {
+          await pullEvents();
+          setLastSynced(new Date());
+          setSyncState("synced");
+          setMessages([buildWelcome()]);
+        } catch {
+          setSyncState("error");
+        }
+      })
+      .catch(() => setAuthState("setup"));
+  }, []);
+
+  // 30s batch push — accumulates writes and pushes periodically
+  useEffect(() => {
+    if (typeof authState === "string") return;
+    const interval = setInterval(async () => {
+      try {
+        const count = await pushEvents();
+        if (count > 0) {
+          setLastSynced(new Date());
+          setSyncState("synced");
+        }
+      } catch {
+        setSyncState("error");
+      }
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [authState]);
+
+  // Pull when window regains focus — picks up changes from other devices
+  useEffect(() => {
+    if (typeof authState === "string") return;
+    const onFocus = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const count = await pullEvents();
+        if (count > 0) {
+          setLastSynced(new Date());
+          setSyncState("synced");
+          setMessages([buildWelcome()]);
+        }
+      } catch {}
+    };
+    document.addEventListener("visibilitychange", onFocus);
+    return () => document.removeEventListener("visibilitychange", onFocus);
+  }, [authState]);
+
+  async function handleLogin() {
+    try {
+      const session = await startOAuth();
+      setAuthState(session);
+      setSyncState("syncing");
+      try {
+        await pullEvents();
+        setLastSynced(new Date());
+        setSyncState("synced");
+        setMessages([buildWelcome()]);
+      } catch {
+        setSyncState("idle");
+      }
+    } catch (e) {
+      console.error("Login failed", e);
+    }
+  }
+
+  async function handleSignOut() {
+    await signOut();
+    setAuthState("unauthenticated");
+    setSyncState("idle");
+    setLastSynced(null);
+  }
+
+  async function onAddSupplier(name: string, phone: string): Promise<Supplier> {
+    const created = await addSupplier({ name, phone });
+    setSuppliers((prev) => [...prev, created]);
+    return created;
+  }
 
   // ── push helpers ────────────────────────────────────────────────────────────
   function pushUser(text: string) {
@@ -412,44 +514,6 @@ export default function App() {
     setMessages((m) => [...m, { id, role: "assistant" as const, text: `**${emp.name}** checked in today${note}. Total: **${emp.checkInDays}** day${emp.checkInDays !== 1 ? "s" : ""}.`, employees: [emp] }]);
   }
 
-  async function handleExport() {
-    try {
-      const json = await invoke<string>("export_data");
-      const blob = new Blob([json], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `store_backup_${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setMessages((m) => [...m, { id: nanoid(), role: "assistant" as const, text: `Export failed: ${e}` }]);
-    }
-  }
-
-  async function handleImport(file: File) {
-    setImporting(true);
-    try {
-      const text = await file.text();
-      // Quick sanity check before sending to Rust
-      const parsed = JSON.parse(text);
-      if (!parsed.products || !parsed.employees) throw new Error("Invalid backup file.");
-      await invoke("import_data", { json: text });
-      setMessages([
-        buildWelcome(),
-        {
-          id: nanoid(),
-          role: "assistant" as const,
-          text: `Import complete — **${parsed.products.length}** product${parsed.products.length !== 1 ? "s" : ""} and **${parsed.employees.length}** employee${parsed.employees.length !== 1 ? "s" : ""} loaded.`,
-        },
-      ]);
-    } catch (e) {
-      setMessages((m) => [...m, { id: nanoid(), role: "assistant" as const, text: `Import failed: ${e}` }]);
-    } finally {
-      setImporting(false);
-    }
-  }
-
   async function handleDeleteEmployee(employeeId: string) {
     await deleteEmployee(employeeId);
     setMessages((m) => m.map((msg) =>
@@ -459,7 +523,107 @@ export default function App() {
     ));
   }
 
+  // ── sell flow ───────────────────────────────────────────────────────────────
+  function onSellProduct(product: Product) {
+    getProducts().then((all) => {
+      const id = nanoid();
+      setMessages((m) => [...m, {
+        id,
+        role: "assistant" as const,
+        text: `Selling **${product.name}** — enter quantity and price.`,
+        widget: "sell" as const,
+        sellingProduct: product,
+        products: all.filter((p) => p.quantity > 0),
+      }]);
+    });
+  }
+
+  async function onConfirmSale(msgId: string, product: Product, qty: number, sellPrice: number) {
+    setMessages((m) => m.map((msg) =>
+      msg.id === msgId ? { ...msg, widget: undefined, sellingProduct: undefined, text: "Processing sale…" } : msg
+    ));
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const entries = (product.salesHistory || "").split(",").filter(Boolean);
+      const idx = entries.findIndex((e) => e.startsWith(today + ":"));
+      if (idx >= 0) {
+        const prev = parseInt(entries[idx].split(":")[1]) || 0;
+        entries[idx] = `${today}:${prev + qty}`;
+      } else {
+        entries.push(`${today}:${qty}`);
+      }
+      entries.sort();
+      if (entries.length > 30) entries.splice(0, entries.length - 30);
+
+      const updated: Product = {
+        ...product,
+        quantity: product.quantity - qty,
+        soldQuantity: product.soldQuantity + qty,
+        sellPrice,
+        salesHistory: entries.join(","),
+      };
+      const saved = await updateProduct(updated);
+      playPop();
+      const profit = (sellPrice - product.buyPrice) * qty;
+      const bsa = calcBuySellAmt(saved);
+      const bsaSign = bsa >= 0 ? "+" : "";
+      setMessages((m) => m.map((msg) =>
+        msg.id === msgId
+          ? {
+              ...msg,
+              text: `Sold **${qty}** × **${saved.name}** @ ₹${sellPrice.toFixed(2)}.\nProfit: **${profit >= 0 ? "+" : ""}₹${profit.toFixed(2)}** · On hand: **${saved.quantity}** · Buy-sell: **${bsaSign}₹${bsa.toFixed(2)}**`,
+              products: [saved],
+            }
+          : msg
+      ));
+    } catch (e) {
+      setMessages((m) => m.map((msg) =>
+        msg.id === msgId ? { ...msg, text: `Sale failed: ${String(e)}` } : msg
+      ));
+    }
+  }
+
+  async function handleRefreshEmployee(employeeId: string) {
+    const all = await getEmployees();
+    const fresh = all.find((e) => e.id === employeeId);
+    if (!fresh) return;
+    setMessages((m) => m.map((msg) =>
+      msg.employees
+        ? { ...msg, employees: msg.employees.map((e) => e.id === employeeId ? fresh : e) }
+        : msg
+    ));
+  }
+
+  function onCancelSell(msgId: string) {
+    setMessages((m) => m.map((msg) =>
+      msg.id === msgId ? { ...msg, widget: undefined, sellingProduct: undefined, text: "Sale cancelled." } : msg
+    ));
+  }
+
   // ── render ──────────────────────────────────────────────────────────────────
+  if (authState === "loading") {
+    return (
+      <div className="h-screen flex items-center justify-center bg-gradient-to-br from-amber-50 to-orange-50">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-400 to-amber-500 flex items-center justify-center shadow-lg animate-pulse">
+            <Store className="w-5 h-5 text-white" />
+          </div>
+          <p className="text-sm text-gray-500">Loading…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authState === "setup") {
+    return <SetupScreen onDone={() => setAuthState("unauthenticated")} />;
+  }
+
+  if (authState === "unauthenticated") {
+    return <LoginScreen onLogin={() => handleLogin()} loading={false} error={null} />;
+  }
+
+  const session = authState as Session;
+
   return (
     <div className="h-screen bg-gradient-to-br from-amber-50 via-orange-50/40 to-sky-50 flex flex-col overflow-hidden">
       {/* Header */}
@@ -475,34 +639,39 @@ export default function App() {
           <span className="font-semibold text-gray-800">Store Manager</span>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleExport}
-            title="Export all data to a backup file"
-            className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-amber-200 text-amber-600 hover:text-amber-700 hover:border-amber-300 hover:bg-amber-50 transition-colors"
-          >
-            <Download className="w-3 h-3" />
-            Export
-          </button>
-          <button
-            onClick={() => importRef.current?.click()}
-            disabled={importing}
-            title="Import data from a backup file"
-            className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-sky-200 text-sky-600 hover:text-sky-700 hover:border-sky-300 hover:bg-sky-50 transition-colors disabled:opacity-50"
-          >
-            <Upload className="w-3 h-3" />
-            {importing ? "Importing…" : "Import"}
-          </button>
-          <input
-            ref={importRef}
-            type="file"
-            accept=".json,application/json"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) handleImport(file);
-              e.target.value = "";
-            }}
-          />
+          {/* Sync status */}
+          <div className="flex items-center gap-1.5 text-xs text-gray-500 mr-1">
+            {syncState === "syncing" && <Loader2 className="w-3 h-3 animate-spin text-sky-500" />}
+            {syncState === "synced" && <Cloud className="w-3 h-3 text-emerald-500" />}
+            {syncState === "error" && <CloudOff className="w-3 h-3 text-red-400" />}
+            {syncState === "pending" && <Cloud className="w-3 h-3 text-amber-400" />}
+            <span className="hidden sm:inline">
+              {syncState === "syncing" ? "Syncing…"
+                : syncState === "error" ? "Sync failed"
+                : syncState === "pending" ? "Pending…"
+                : lastSynced ? `Synced ${lastSynced.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                : ""}
+            </span>
+          </div>
+
+          {/* User avatar + sign out */}
+          <div className="flex items-center gap-1.5">
+            {session.picture ? (
+              <img src={session.picture} alt={session.name} className="w-6 h-6 rounded-full" title={session.email} />
+            ) : (
+              <div className="w-6 h-6 rounded-full bg-indigo-200 flex items-center justify-center text-[10px] font-bold text-indigo-700">
+                {session.email[0].toUpperCase()}
+              </div>
+            )}
+            <button
+              onClick={handleSignOut}
+              title="Sign out"
+              className="flex items-center gap-1 text-xs px-2 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:text-gray-700 hover:bg-gray-50 transition-colors"
+            >
+              <LogOut className="w-3 h-3" />
+            </button>
+          </div>
+
           <button
             onClick={() => setShowReadme((s) => !s)}
             title="Command reference"
@@ -525,6 +694,11 @@ export default function App() {
             <Message
               key={msg.id}
               msg={msg}
+              suppliers={suppliers}
+              onAddSupplier={onAddSupplier}
+              onSellProduct={onSellProduct}
+              onConfirmSale={(product, qty, price) => onConfirmSale(msg.id, product, qty, price)}
+              onCancelSell={() => onCancelSell(msg.id)}
               onImagesReady={(imgs, names) => onImagesReady(msg.id, imgs, names)}
               onOcrDone={(p, rawText) => onOcrDone(msg.id, p, rawText)}
               onConfirm={(p) => onConfirm(msg.id, p)}
@@ -536,6 +710,7 @@ export default function App() {
               onUpdateEmployee={(orig, edits) => onUpdateEmployee(msg.id, orig, edits)}
               onDeleteEmployee={handleDeleteEmployee}
               onCheckInEmployee={handleCheckInEmployee}
+              onRefreshEmployee={handleRefreshEmployee}
               onEditEmployee={onEditEmployee}
               onEditProduct={onEditProduct}
               onUpdateProduct={(orig, edits) => onUpdateProduct(msg.id, orig, edits)}
@@ -566,6 +741,11 @@ export default function App() {
 // ── Message bubble ────────────────────────────────────────────────────────────
 interface MessageProps {
   msg: ChatMessage;
+  suppliers: Supplier[];
+  onAddSupplier: (name: string, phone: string) => Promise<Supplier>;
+  onSellProduct: (product: Product) => void;
+  onConfirmSale: (product: Product, qty: number, sellPrice: number) => void;
+  onCancelSell: () => void;
   onImagesReady: (images: string[], imageNames: string[]) => void;
   onOcrDone: (product: Omit<NewProduct, "images" | "imageLocation">, rawText: string) => void;
   onConfirm: (p: NewProduct) => void;
@@ -577,6 +757,7 @@ interface MessageProps {
   onUpdateEmployee: (original: Employee, edits: NewEmployee) => void;
   onDeleteEmployee: (id: string) => void;
   onCheckInEmployee: (id: string, hours?: number) => void;
+  onRefreshEmployee: (id: string) => void;
   onEditEmployee: (employee: Employee) => void;
   onEditProduct: (product: Product) => void;
   onUpdateProduct: (original: Product, edits: NewProduct) => void;
@@ -586,6 +767,11 @@ interface MessageProps {
 
 function Message({
   msg,
+  suppliers,
+  onAddSupplier,
+  onSellProduct,
+  onConfirmSale,
+  onCancelSell,
   onImagesReady,
   onOcrDone,
   onConfirm,
@@ -597,6 +783,7 @@ function Message({
   onUpdateEmployee,
   onDeleteEmployee,
   onCheckInEmployee,
+  onRefreshEmployee,
   onEditEmployee,
   onEditProduct,
   onUpdateProduct,
@@ -694,8 +881,10 @@ function Message({
               images={msg.pendingProduct.images ?? []}
               imageNames={msg.pendingProduct.imageLocation ?? []}
               scanning={msg.ocrLoading}
+              suppliers={suppliers}
               onConfirm={onConfirm}
               onCancel={onCancelConfirm}
+              onAddSupplier={onAddSupplier}
             />
           </div>
         )}
@@ -703,7 +892,7 @@ function Message({
         {/* Report widget — inventory */}
         {msg.widget === "report" && msg.products && (
           <div className="bg-white border border-amber-100 rounded-2xl rounded-bl-sm p-4 shadow-sm">
-            <ReportWidget products={msg.products} />
+            <ReportWidget products={msg.products} suppliers={suppliers} />
           </div>
         )}
 
@@ -742,12 +931,40 @@ function Message({
           </div>
         )}
 
-        {/* Product tiles — hidden when a chart/report/trend widget is showing them */}
-        {msg.widget !== "report" && msg.widget !== "product_chart" && msg.widget !== "product_trend" && msg.products && msg.products.length > 0 && (
+        {/* Sell widget */}
+        {msg.widget === "sell" && msg.products && (
+          <div className="bg-white border border-emerald-100 rounded-2xl rounded-bl-sm p-4 shadow-sm">
+            <SellWidget
+              products={msg.products}
+              initial={msg.sellingProduct}
+              onConfirm={onConfirmSale}
+              onCancel={onCancelSell}
+            />
+          </div>
+        )}
+
+        {/* Supplier report widget */}
+        {msg.widget === "supplier_report" && msg.products && (
+          <div className="bg-white border border-violet-100 rounded-2xl rounded-bl-sm p-4 shadow-sm">
+            <SupplierReportWidget products={msg.products} suppliers={suppliers} />
+          </div>
+        )}
+
+        {/* Calculator widget */}
+        {msg.widget === "calculator" && (
+          <div className="bg-white border border-slate-100 rounded-2xl rounded-bl-sm p-4 shadow-sm inline-block">
+            <CalculatorWidget />
+          </div>
+        )}
+
+        {/* Product tiles — hidden when a chart/report/trend/supplier/sell widget is showing them */}
+        {msg.widget !== "report" && msg.widget !== "product_chart" && msg.widget !== "product_trend" && msg.widget !== "supplier_report" && msg.widget !== "sell" && msg.products && msg.products.length > 0 && (
           <div className="flex flex-wrap gap-3">
             <AnimatePresence>
               {msg.products.map((p) => (
-                <ProductTile key={p.id} product={p} onDelete={onDeleteTile} onEdit={onEditProduct} />
+                <ProductTile key={p.id} product={p} onDelete={onDeleteTile} onEdit={onEditProduct}
+                  onSell={onSellProduct}
+                  supplierName={suppliers.find((s) => s.id === p.supplierId)?.name ?? ""} />
               ))}
             </AnimatePresence>
           </div>
@@ -771,8 +988,10 @@ function Message({
               images={msg.editingProduct.images}
               imageNames={msg.editingProduct.imageLocation}
               scanning={false}
+              suppliers={suppliers}
               onConfirm={(edits) => onUpdateProduct(msg.editingProduct!, edits)}
               onCancel={onCancelProductEdit}
+              onAddSupplier={onAddSupplier}
             />
           </div>
         )}
@@ -793,7 +1012,7 @@ function Message({
           <div className="flex flex-wrap gap-3">
             <AnimatePresence>
               {msg.employees.map((e) => (
-                <EmployeeTile key={e.id} employee={e} onDelete={onDeleteEmployee} onEdit={onEditEmployee} onCheckIn={onCheckInEmployee} />
+                <EmployeeTile key={e.id} employee={e} onDelete={onDeleteEmployee} onEdit={onEditEmployee} onCheckIn={onCheckInEmployee} onRefresh={onRefreshEmployee} />
               ))}
             </AnimatePresence>
           </div>

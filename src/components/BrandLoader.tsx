@@ -15,7 +15,7 @@ function ink(drawStart: number, drawEnd: number) {
       times: [0, drawStart / TOTAL, drawEnd / TOTAL, 0.87, 1],
       duration: TOTAL,
       repeat: Infinity,
-      ease: ["linear", "easeOut", "linear", "easeIn"] as const,
+      ease: ["linear", "easeOut", "linear", "easeIn"] as any,
     },
   };
 }

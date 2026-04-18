@@ -1,4 +1,4 @@
-import { BarChart2, FileText, Users, Calendar, TrendingUp, TrendingDown, Wallet } from "lucide-react";
+import { BarChart2, FileText, Users, Calendar, TrendingUp, TrendingDown, Wallet, Store } from "lucide-react";
 
 interface ReportOption {
   icon: React.ComponentType<{ className?: string }>;
@@ -51,6 +51,19 @@ const PRODUCT_REPORTS: ReportOption[] = [
     iconColor: "text-red-500",
     border: "border-red-100",
     hover: "hover:bg-red-50",
+  },
+];
+
+const SUPPLIER_REPORTS: ReportOption[] = [
+  {
+    icon: Store,
+    title: "Supplier report",
+    description: "Spend per supplier (pie chart) + per-supplier stock, low-stock & expiry overview",
+    cmd: "supplier report",
+    color: "bg-violet-100",
+    iconColor: "text-violet-600",
+    border: "border-violet-100",
+    hover: "hover:bg-violet-50",
   },
 ];
 
@@ -130,6 +143,17 @@ export function ReportMenuWidget({ onRun }: Props) {
         </p>
         <div className="flex flex-col gap-1.5">
           {PRODUCT_REPORTS.map((opt) => (
+            <OptionCard key={opt.cmd} option={opt} onRun={onRun} />
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="text-[10px] text-violet-500 uppercase tracking-wider font-semibold mb-1.5 px-0.5">
+          Supplier reports
+        </p>
+        <div className="flex flex-col gap-1.5">
+          {SUPPLIER_REPORTS.map((opt) => (
             <OptionCard key={opt.cmd} option={opt} onRun={onRun} />
           ))}
         </div>

@@ -1,16 +1,22 @@
 import { useState } from "react";
 import { Copy, Download, Check, TrendingUp, TrendingDown, AlertTriangle, Clock, Mail, MessageCircle } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { Product } from "../types";
+import type { Product, Supplier } from "../types";
 import { calcBuySellAmt } from "../types";
 
 interface Props {
   products: Product[];
+  suppliers?: Supplier[];
 }
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 
-function toWhatsApp(products: Product[]): string {
+function supplierName(product: Product, suppliers: Supplier[]): string {
+  if (!product.supplierId) return "";
+  return suppliers.find((s) => s.id === product.supplierId)?.name ?? "";
+}
+
+function toWhatsApp(products: Product[], suppliers: Supplier[]): string {
   const today = new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
   const stockValue = products.reduce((s, p) => s + p.buyPrice * p.quantity, 0);
   const buySell    = products.reduce((s, p) => s + calcBuySellAmt(p), 0);
@@ -43,8 +49,9 @@ function toWhatsApp(products: Product[]): string {
       const d = new Date(p.expiryDate);
       if (!isNaN(d.getTime()) && d <= in90) flags.push("⏰ Exp " + p.expiryDate);
     }
+    const sName = supplierName(p, suppliers);
     lines.push(
-      `${i + 1}. *${p.name}*${p.brand ? " · " + p.brand : ""}`,
+      `${i + 1}. *${p.name}*${p.brand ? " · " + p.brand : ""}${sName ? ` · ${sName}` : ""}`,
       `   Stock: ${p.quantity} · Sold: ${p.soldQuantity} · ₹${p.buyPrice.toFixed(2)}→₹${p.sellPrice.toFixed(2)}`,
       ...(flags.length ? [`   ${flags.join(" · ")}`] : []),
       ``,
@@ -54,14 +61,16 @@ function toWhatsApp(products: Product[]): string {
   return lines.join("\n").trimEnd();
 }
 
-function toCsv(products: Product[]): string {
-  const header = "Name,Brand,Language,Quantity,Sold,Buy Price,Sell Price,Manufacture Date,Expiry Date,Stock Value,Buy-Sell Amount";
+function toCsv(products: Product[], suppliers: Supplier[]): string {
+  const header = "Name,Brand,Supplier,Category,Quantity,Sold,Buy Price,Sell Price,Manufacture Date,Expiry Date,Stock Value,Buy-Sell Amount";
   const rows = products.map((p) => {
     const bsa = calcBuySellAmt(p);
+    const sName = supplierName(p, suppliers);
     return [
       `"${p.name.replace(/"/g, '""')}"`,
       `"${p.brand.replace(/"/g, '""')}"`,
-      `"${p.sourceLanguage}"`,
+      `"${sName}"`,
+      `"${p.category}"`,
       p.quantity,
       p.soldQuantity,
       p.buyPrice.toFixed(2),
@@ -88,11 +97,11 @@ function toPlainText(products: Product[]): string {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function ReportWidget({ products }: Props) {
+export function ReportWidget({ products, suppliers = [] }: Props) {
   const [copied, setCopied] = useState(false);
 
   function shareWhatsApp() {
-    const text = toWhatsApp(products);
+    const text = toWhatsApp(products, suppliers);
     openUrl(`whatsapp://send?text=${encodeURIComponent(text)}`);
   }
 
@@ -104,13 +113,13 @@ export function ReportWidget({ products }: Props) {
   }
 
   async function copyText() {
-    await navigator.clipboard.writeText(toWhatsApp(products));
+    await navigator.clipboard.writeText(toWhatsApp(products, suppliers));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }
 
   function downloadCsv() {
-    const csv  = toCsv(products);
+    const csv  = toCsv(products, suppliers);
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
@@ -169,18 +178,23 @@ export function ReportWidget({ products }: Props) {
 
       {/* Product list preview */}
       <div className="border border-amber-100 rounded-xl overflow-hidden max-h-48 overflow-y-auto">
-        {products.map((p, i) => (
+        {products.map((p, i) => {
+          const sName = supplierName(p, suppliers);
+          return (
           <div key={p.id} className={`flex items-center justify-between px-3 py-2 text-xs ${i % 2 === 0 ? "bg-white" : "bg-amber-50/40"}`}>
             <div className="flex-1 min-w-0">
               <span className="font-medium text-gray-800 truncate block">{p.name}</span>
-              {p.brand && <span className="text-[10px] text-gray-400">{p.brand}</span>}
+              <div className="flex gap-1.5 items-center">
+                {p.brand && <span className="text-[10px] text-gray-400">{p.brand}</span>}
+                {sName && <span className="text-[10px] text-violet-500">· {sName}</span>}
+              </div>
             </div>
             <div className="text-right flex-shrink-0 ml-2">
               <span className="text-gray-600">×{p.quantity}</span>
               <span className="text-gray-400 ml-1.5">₹{p.sellPrice.toFixed(2)}</span>
             </div>
           </div>
-        ))}
+        ); })}
       </div>
 
       {/* Share buttons */}

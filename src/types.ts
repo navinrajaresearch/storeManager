@@ -1,8 +1,16 @@
+export interface Supplier {
+  id: string;
+  name: string;
+  phone: string;
+}
+
 export interface Product {
   id: string;               // UUID, auto-generated
   brand: string;            // extracted from packaging
-  sourceLanguage: string;   // language detected on packaging
+  sourceLanguage: string;   // language detected on packaging (OCR only, not shown in UI)
   name: string;             // product name
+  category: string;         // product category, defaults to "Food & Beverage"
+  supplierId: string;       // FK to suppliers.id, empty string = none
   manufactureDate: string;  // "YYYY-MM" | "YYYY-MM-DD" | "N/A"
   expiryDate: string;       // "YYYY-MM" | "YYYY-MM-DD" | "N/A"
   imageLocation: string[];  // original file names of uploaded images (max 2)
@@ -51,9 +59,9 @@ export function monthlyEquivalent(e: Employee): number {
 export type NewEmployee = Omit<Employee, "id">;
 
 export const CATEGORIES = [
+  "Food & Beverage",
   "Electronics",
   "Clothing",
-  "Food & Beverage",
   "Home & Garden",
   "Sports",
   "Books",
@@ -75,7 +83,8 @@ export interface ChatMessage {
   text: string;
   products?: Product[];
   employees?: Employee[];
-  widget?: "image_upload" | "employee_form" | "employee_edit" | "product_edit" | "report" | "employee_report" | "salary_report" | "salary_picker" | "product_chart" | "report_menu" | "search_disambig" | "product_trend";
+  widget?: "image_upload" | "employee_form" | "employee_edit" | "product_edit" | "report" | "employee_report" | "salary_report" | "salary_picker" | "product_chart" | "report_menu" | "search_disambig" | "product_trend" | "calculator" | "supplier_report" | "sell";
+  sellingProduct?: Product;
   reportSubtype?: string;
   chartPeriod?: string;
   pendingProduct?: Partial<NewProduct>;
@@ -129,4 +138,5 @@ export const SUGGESTION_CHIPS = [
   { label: "Add product",    cmd: "add product"     },
   { label: "Employees",      cmd: "list employees"  },
   { label: "Reports",        cmd: "reports"         },
+  { label: "Calculator",     cmd: "calculator"      },
 ] as const;

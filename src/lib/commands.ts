@@ -5,7 +5,7 @@ import { getEmployees, deleteEmployee, checkinEmployee, updateEmployee } from ".
 import { nanoid } from "../utils/nanoid";
 import { semanticMatch, topMatches, extractArgs, INTENT_LABEL } from "./ai";
 
-export type CommandResult = Pick<ChatMessage, "text" | "products" | "employees" | "widget" | "reportSubtype" | "chartPeriod" | "editingEmployee" | "searchQuery">;
+export type CommandResult = Pick<ChatMessage, "text" | "products" | "employees" | "widget" | "reportSubtype" | "chartPeriod" | "editingEmployee" | "searchQuery" | "sellingProduct">;
 
 // ── Product name matching ─────────────────────────────────────────────────────
 
@@ -187,6 +187,36 @@ async function processSetPrice(
 
 export async function processCommand(input: string): Promise<CommandResult> {
   const t = input.trim().toLowerCase();
+
+  // ── sell (open sell widget) ───────────────────────────────────────────────
+  // "sell", "sell Kit Kat" (no number = open widget; with number goes to processSold below)
+  if (t === "sell") {
+    const products = await getProducts();
+    const available = products.filter((p) => p.quantity > 0);
+    if (!available.length) return { text: "No products with stock available to sell." };
+    return {
+      text: "Which product are you selling?",
+      widget: "sell",
+      products: available,
+    };
+  }
+  {
+    const m = /^sell\s+([^\d].*)$/i.exec(input.trim());
+    if (m) {
+      const products = await getProducts();
+      const available = products.filter((p) => p.quantity > 0);
+      if (!available.length) return { text: "No products with stock available to sell." };
+      const match = findProduct(products, m[1].trim());
+      const pre = match !== "none" && match !== "ambiguous" ? match : undefined;
+      if (match === "ambiguous") return { text: ambiguousMsg(products, m[1].trim()) };
+      return {
+        text: pre ? `Selling **${pre.name}** — enter quantity and price.` : "Which product are you selling?",
+        widget: "sell",
+        products: available,
+        ...(pre ? { sellingProduct: pre } : {}),
+      };
+    }
+  }
 
   // ── sold N [product] ──────────────────────────────────────────────────────
   // "sold 5 iPhone", "sell 3 units of Kit Kat", "selling 2 headphones"
@@ -399,21 +429,43 @@ export async function processCommand(input: string): Promise<CommandResult> {
     }
   }
 
-  // ── check in [name] ───────────────────────────────────────────────────────
+  // ── check in [name] [N hours] ─────────────────────────────────────────────
+  // supports: "check in alice", "check in alice 4", "check in alice 4h", "check in alice 4 hours"
   {
     const m = /^check[\s-]?in\s+(.+)$/i.exec(input.trim());
     if (m) {
+      let nameQuery = m[1].trim();
+      let hours: number | undefined;
+
+      // Try to peel off a trailing hours value: "alice 4", "alice 4h", "alice 4 hours"
+      const hoursM = /^(.*?)\s+(\d+(?:\.\d+)?)\s*(?:h(?:ours?|rs?)?)?\s*$/i.exec(nameQuery);
+      if (hoursM && parseFloat(hoursM[2]) > 0) {
+        nameQuery = hoursM[1].trim();
+        hours = parseFloat(hoursM[2]);
+      }
+
       const employees = await getEmployees();
-      const match = findEmployee(employees, m[1].trim());
-      if (match === "none") return { text: `No employee found matching **"${m[1].trim()}"**.` };
-      if (match === "ambiguous") return { text: ambiguousEmployeeMsg(employees, m[1].trim()) };
+      const match = findEmployee(employees, nameQuery);
+      if (match === "none") return { text: `No employee found matching **"${nameQuery}"**.` };
+      if (match === "ambiguous") return { text: ambiguousEmployeeMsg(employees, nameQuery) };
+
       const today = new Date().toISOString().slice(0, 10);
       if (match.lastCheckIn === today) {
         return { text: `**${match.name}** already checked in today (${today}).`, employees: [match] };
       }
-      const updated = await checkinEmployee(match.id);
+
+      // Hourly employees must have hours
+      if (match.salaryType === "hourly" && hours === undefined) {
+        return {
+          text: `**${match.name}** is paid hourly. How many hours did they work today?\nTry: \`check in ${match.name} 6\` or use the tile check-in button.`,
+        };
+      }
+
+      const updated = await checkinEmployee(match.id, hours);
+      const hoursNote = match.salaryType === "hourly" && hours !== undefined
+        ? ` (${hours} hr${hours !== 1 ? "s" : ""})` : "";
       return {
-        text: `Checked in **${updated.name}** — day **${updated.checkInDays}** total.`,
+        text: `Checked in **${updated.name}**${hoursNote} — day **${updated.checkInDays}** total.`,
         employees: [updated],
       };
     }
@@ -582,6 +634,17 @@ export async function processCommand(input: string): Promise<CommandResult> {
     }
   }
 
+  // ── supplier report ───────────────────────────────────────────────────────
+  if (/supplier\s+report|supplier\s+spend|spend\s+(?:by|per)\s+supplier|supplier\s+overview/i.test(t)) {
+    const products = await getProducts();
+    if (!products.length) return { text: "No products in inventory yet." };
+    return {
+      text: `Supplier report — **${products.length}** product${products.length !== 1 ? "s" : ""}.`,
+      widget: "supplier_report",
+      products,
+    };
+  }
+
   // ── inventory report ──────────────────────────────────────────────────────
   if (/^(?:inventory|stock|product)\s+report$/i.test(t)) {
     const products = await getProducts();
@@ -597,6 +660,11 @@ export async function processCommand(input: string): Promise<CommandResult> {
       text: "Which report would you like?",
       widget: "report_menu",
     };
+  }
+
+  // ── calculator ────────────────────────────────────────────────────────────
+  if (t === "calculator" || t === "calc" || t === "calculate") {
+    return { text: "", widget: "calculator" };
   }
 
   // ── help ──────────────────────────────────────────────────────────────────
@@ -617,7 +685,8 @@ export async function processCommand(input: string): Promise<CommandResult> {
         "",
         "_Employees_",
         "• `list employees` · `add employee`",
-        "• `check in [name]` — mark attendance",
+        "• `check in [name]` — mark attendance (monthly staff)",
+        "• `check in [name] 6` — mark attendance with hours (hourly staff)",
         "• `who checked in today` · `who checked in this week`",
         "• `checked in last 7 days` — any number of days",
         "• `employee stats` — headcount & salary overview",
@@ -628,8 +697,10 @@ export async function processCommand(input: string): Promise<CommandResult> {
         "",
         "_Reports_",
         "• `reports` — open report picker",
+        "• `calculator` — basic calculator (+  −  ×  ÷)",
         "• `inventory report` · `product chart`",
         "• `trending products` · `unpopular products`",
+        "• `supplier report` — spend pie chart + supplier overview",
         "• `employee report` · `salary report`",
         "• `salary today` · `monthly salary` · `company spend`",
       ].join("\n"),
@@ -731,6 +802,9 @@ export async function processCommand(input: string): Promise<CommandResult> {
         const today = new Date().toISOString().slice(0, 10);
         if (match.lastCheckIn === today)
           return { text: `**${match.name}** already checked in today (${today}).`, employees: [match] };
+        if (match.salaryType === "hourly") {
+          return { text: `**${match.name}** is paid hourly. How many hours did they work today?\nTry: \`check in ${match.name} 6\`` };
+        }
         const updated = await checkinEmployee(match.id);
         return { text: `Checked in **${updated.name}** — day **${updated.checkInDays}** total.`, employees: [updated] };
       }
@@ -833,7 +907,8 @@ export async function processCommand(input: string): Promise<CommandResult> {
             "",
             "_Employees_",
             "• `list employees` · `add employee`",
-            "• `check in [name]` — mark attendance",
+            "• `check in [name]` — mark attendance (monthly staff)",
+            "• `check in [name] 6` — mark attendance with hours (hourly staff)",
             "• `who checked in today` · `who checked in this week`",
             "• `checked in last 7 days` — any number of days",
             "• `employee stats` — headcount & salary overview",
@@ -846,6 +921,7 @@ export async function processCommand(input: string): Promise<CommandResult> {
             "• `reports` — open report picker",
             "• `inventory report` · `product chart`",
             "• `trending products` · `unpopular products`",
+            "• `supplier report` — spend pie chart + supplier overview",
             "• `employee report` · `salary report`",
             "• `salary today` · `monthly salary` · `company spend`",
           ].join("\n"),
